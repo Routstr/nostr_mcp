@@ -13,6 +13,7 @@ from pynostr.relay_manager import RelayManager
 from pynostr.filters import FiltersList, Filters
 from pynostr.key import PrivateKey, PublicKey
 from dotenv import load_dotenv
+from utils import fetch_event_context, summarize_thread_context
 
 # Load environment variables
 load_dotenv()
@@ -435,6 +436,41 @@ async def convert_pubkey_format(pubkey: str) -> str:
             'success': False,
             'error': f'Unexpected error: {str(e)}',
             'input': pubkey
+        })
+
+@mcp.tool()
+async def fetch_event_thread_context(event_id: str, relays: Optional[List[str]] = None) -> str:
+    """Fetch the full conversation context for a Nostr event by following reply chains to the root.
+    
+    Args:
+        event_id: The event ID to analyze for context
+        relays: Optional list of relays to use for fetching events
+        
+    Returns:
+        JSON string containing thread context, events, and summary
+    """
+    try:
+        # Use the fetch_event_context function from utils
+        result = await fetch_event_context(
+            event_id=event_id,
+            fetch_events_func=fetch_nostr_events,
+            relays=relays
+        )
+        
+        # Add formatted summary for easy reading
+        if result['success']:
+            result['formatted_summary'] = summarize_thread_context(result)
+        
+        return json.dumps(result, indent=2)
+        
+    except Exception as e:
+        return json.dumps({
+            'success': False,
+            'error': f"Unexpected error: {str(e)}",
+            'nevent': event_id,
+            'context': '',
+            'no_of_events': 0,
+            'events': []
         })
 
 if __name__ == "__main__":
