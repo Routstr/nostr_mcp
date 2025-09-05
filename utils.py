@@ -206,3 +206,65 @@ def summarize_thread_context(context_result: Dict[str, Any]) -> str:
         summary_lines.append(f"{event['event_index']}. {timestamp_str} {content_preview}")
     
     return "\n".join(summary_lines)
+
+
+import os
+from glob import glob
+
+def files_exist_for_timestamp(npub: str, since: int, curr_timestamp: int) -> bool:
+    """
+    Check if files already exist for the given npub, since, and curr_timestamp.
+    
+    Args:
+        npub: The npub identifier (main_npub)
+        since: The since timestamp
+        curr_timestamp: The current timestamp
+        
+    Returns:
+        True if files exist, False otherwise
+    """
+    base_dir = os.path.join(os.path.dirname(__file__), "mcp_responses")
+    pattern = os.path.join(
+        base_dir, f"*_{since}_{curr_timestamp}_{npub}.json"
+    )
+    files = glob(pattern)
+    return len(files) > 0
+
+def load_formatted_npub_output(npub: str, since: int, curr_timestamp: int) -> Dict[str, Any]:
+   """
+   Reads all matching files from mcp_responses and converts them into the required formatted output schema.
+   Skips corrupted files safely.
+   """
+   base_dir = os.path.join(os.path.dirname(__file__), "mcp_responses")
+   pattern = os.path.join(
+       base_dir, f"*_{since}_{curr_timestamp}_{npub}.json"
+   )
+   files = glob(pattern)
+
+   output = []
+   for file in files:
+       try:
+           with open(file, "r") as f:
+               data = json.load(f)
+           npub_summary = {
+               "npub": data.get("npub", ""),
+               "name": data.get("name", ""),
+               "profile_pic": data.get("profile_pic", ""),
+               "events": []
+           }
+           for ev in data.get("events", []):
+               npub_summary["events"].append({
+                   "event_id": ev.get("event_id", ""),
+                   "event_content": ev.get("event_content", ""),
+                   "context_content": ev.get("context_content", ""),
+                   "context_summary": ev.get("context_summary", ""),
+                   "timestamp": ev.get("timestamp", 0),
+                   "relevancy_score": ev.get("relevancy_score", 0),
+                   "events_in_thread": ev.get("events_in_thread", []),
+               })
+           output.append(npub_summary)
+       except Exception as e:
+           logger.warning(f"Skipping corrupted file {file}: {e}")
+           continue
+
+   return {"output": output}

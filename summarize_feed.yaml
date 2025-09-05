@@ -15,7 +15,7 @@ instructions: |
   - First, search for outbox relays for {{ npub }}. If it's an npub, convert it into hex format. 
   - Fetch their kind 3 event to fetch all their followings. 
   - Put 10 of the npubs, which are essentially all the the people the given npub is following, into the get_events_summary function in parallel to fetch all the relevant events by an npub. Do NOT summarize events by the main npub itself. 
-  - Store all responses from sub_recipes to mcp_responses folder as json in /Users/r/projects/routstr_main/nostr_mcp. name it like <npub>_<since_timestamp>_<uuid>.json {{ uuid }}
+  - Store all responses from sub_recipes to mcp_responses folder as json in /Users/r/projects/routstr_main/nostr_mcp. name it like <npub>_<since_timestamp>_<curr_timestamp>_<main_npub>.json
 
 extensions:
 - type: stdio
@@ -52,7 +52,7 @@ activities:
 author:
   contact: r
 
-prompt: "Your task is to summarize posts for {{ npub }} since the timestamp {{since}}"
+prompt: "Your task is to summarize posts for {{ npub }} since the timestamp {{since}} with curr_timestamp {{ curr_timestamp }} for file naming"
 
 parameters:
   - key: npub
@@ -65,10 +65,10 @@ parameters:
     requirement: required
     description: "The timestamp we use to fetch events"
 
-  - key: uuid
-    input_type: string
+  - key: curr_timestamp
+    input_type: number
     requirement: required
-    description: "UUID to name json files during response"
+    description: "current_timestamp_for file naming"
 
 sub_recipes:
   - name: "summarize_and_add_relevancy_score"
