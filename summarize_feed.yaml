@@ -38,7 +38,7 @@ extensions:
   available_tools: []
 
 settings:
-  goose_provider: openrouter
+  goose_provider: openai
   goose_model: x-ai/grok-code-fast-1
   temperature: 0.0
 

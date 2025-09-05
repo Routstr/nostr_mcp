@@ -1,8 +1,10 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import subprocess
 import utils
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
 @app.route('/run', methods=['POST'])
 def run_command():
@@ -35,6 +37,7 @@ def run_command():
             capture_output=True,
             text=True
         )
+        print(result)
         
         # If command succeeded, return formatted JSON output
         if result.returncode == 0:
