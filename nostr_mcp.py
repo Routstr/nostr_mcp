@@ -13,7 +13,7 @@ from pynostr.relay_manager import RelayManager
 from pynostr.filters import FiltersList, Filters
 from pynostr.key import PrivateKey, PublicKey
 from dotenv import load_dotenv
-from utils import fetch_event_context, summarize_thread_context
+from utils import fetch_event_context, summarize_thread_context, parse_e_tags
 
 # Load environment variables
 load_dotenv()
@@ -332,10 +332,18 @@ async def get_nostr_profile(pubkey: str, relays: Optional[List[str]] = None) -> 
         except json.JSONDecodeError:
             profile_data = {'raw_content': metadata_event['content']}
         
+        # Convert hex pubkey back to npub format
+        try:
+            pk_for_npub = PublicKey(bytes.fromhex(hex_pubkey))
+            npub_format = pk_for_npub.npub
+        except Exception as npub_error:
+            # Fallback if npub conversion fails
+            npub_format = f"hex:{hex_pubkey}"
+        
         return json.dumps({
             'success': True,
             'pubkey': hex_pubkey,
-            'npub': PublicKey(bytes.fromhex(hex_pubkey)).npub(),
+            'npub': npub_format,
             'profile': profile_data,
             'last_updated': metadata_event['created_at'],
             'event_id': metadata_event['id']
@@ -380,62 +388,91 @@ async def search_nostr_content(
         })
 
 @mcp.tool()
-async def convert_pubkey_format(pubkey: str) -> str:
-    """Convert between npub and hex pubkey formats.
+async def convert_pubkey_format(pubkeys: List[str]) -> str:
+    """Convert between npub and hex pubkey formats for multiple pubkeys in batch.
     
     Args:
-        pubkey: Public key in either npub or hex format
+        pubkeys: List of public keys in either npub or hex format
         
     Returns:
-        JSON with both formats or error message
+        JSON with conversion results for all pubkeys
     """
     try:
-        if pubkey.startswith('npub'):
-            # Convert npub to hex
+        results = []
+        
+        for pubkey in pubkeys:
             try:
-                pk = PublicKey.from_npub(pubkey)
-                hex_format = pk.hex()
-                return json.dumps({
-                    'success': True,
-                    'input': pubkey,
-                    'input_format': 'npub',
-                    'npub': pubkey,
-                    'hex': hex_format
-                }, indent=2)
+                if pubkey.startswith('npub'):
+                    # Convert npub to hex
+                    try:
+                        pk = PublicKey.from_npub(pubkey)
+                        hex_format = pk.hex()
+                        results.append({
+                            'success': True,
+                            'input': pubkey,
+                            'input_format': 'npub',
+                            'npub': pubkey,
+                            'hex': hex_format
+                        })
+                    except Exception as e:
+                        results.append({
+                            'success': False,
+                            'error': f'Invalid npub format: {str(e)}',
+                            'input': pubkey
+                        })
+                else:
+                    # Assume hex format, convert to npub
+                    try:
+                        # Validate hex format
+                        if len(pubkey) != 64:
+                            raise ValueError("Hex pubkey must be 64 characters long")
+                        
+                        # Try to create PublicKey from hex
+                        pk = PublicKey(bytes.fromhex(pubkey))
+                        try:
+                            npub_format = pk.npub
+                        except Exception:
+                            npub_format = f"hex:{pubkey}"
+                        results.append({
+                            'success': True,
+                            'input': pubkey,
+                            'input_format': 'hex',
+                            'npub': npub_format,
+                            'hex': pubkey
+                        })
+                    except Exception as e:
+                        results.append({
+                            'success': False,
+                            'error': f'Invalid hex format: {str(e)}',
+                            'input': pubkey
+                        })
             except Exception as e:
-                return json.dumps({
+                results.append({
                     'success': False,
-                    'error': f'Invalid npub format: {str(e)}',
+                    'error': f'Unexpected error: {str(e)}',
                     'input': pubkey
                 })
-        else:
-            # Assume hex format, convert to npub
-            try:
-                # Validate hex format
-                if len(pubkey) != 64:
-                    raise ValueError("Hex pubkey must be 64 characters long")
-                
-                # Try to create PublicKey from hex
-                pk = PublicKey(bytes.fromhex(pubkey))
-                npub_format = pk.npub()
-                return json.dumps({
-                    'success': True,
-                    'input': pubkey,
-                    'input_format': 'hex',
-                    'npub': npub_format,
-                    'hex': pubkey
-                }, indent=2)
-            except Exception as e:
-                return json.dumps({
-                    'success': False,
-                    'error': f'Invalid hex format: {str(e)}',
-                    'input': pubkey
-                })
+        
+        # Calculate summary statistics
+        successful_conversions = len([r for r in results if r['success']])
+        failed_conversions = len([r for r in results if not r['success']])
+        
+        return json.dumps({
+            'success': True,
+            'total_processed': len(pubkeys),
+            'successful_conversions': successful_conversions,
+            'failed_conversions': failed_conversions,
+            'results': results
+        }, indent=2)
+        
     except Exception as e:
         return json.dumps({
             'success': False,
-            'error': f'Unexpected error: {str(e)}',
-            'input': pubkey
+            'error': f'Unexpected error processing batch: {str(e)}',
+            'total_processed': 0,
+            'successful_conversions': 0,
+            'failed_conversions': 0,
+            'results': []
         })
 
 @mcp.tool()
@@ -472,6 +509,148 @@ async def fetch_event_thread_context(event_id: str, relays: Optional[List[str]] 
             'no_of_events': 0,
             'events': []
         })
+
+@mcp.tool()
+async def get_events_for_summary(
+    pubkey: str,
+    since: int,
+    relays: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """Fetch events for a user since a timestamp and include full thread context for replies.
+    
+    Args:
+        pubkey: npub or hex public key
+        since: Unix timestamp to fetch events from
+        relays: Optional list of relays (if not provided, will fetch from user's kind 10002)
+        
+    Returns:
+        Dict containing formatted events with thread context
+    """
+    try:
+        # Convert pubkey to hex if needed
+        hex_pubkey = pubkey
+        if pubkey.startswith('npub'):
+            pk = PublicKey.from_npub(pubkey)
+            hex_pubkey = pk.hex()
+        
+        # Use provided relays or fallback to default relays
+        used_relays = relays or (MAIN_RELAYS + BACKUP_RELAYS)
+        
+        # Fetch only kind 1 events (text notes) from this user since the timestamp
+        events_result = await fetch_nostr_events(
+            pubkey=hex_pubkey,
+            kinds=[1],
+            since=since,
+        )
+        events_parsed = json.loads(events_result)
+        
+        if not events_parsed['success']:
+            return {
+                'success': False,
+                'error': events_parsed.get('error', 'Failed to fetch events'),
+                'events': []
+            }
+        
+        formatted_events = []
+        processed_threads = set()  # Track which threads we've already processed
+        
+        for event in events_parsed['events']:
+            event_id = event['id']
+            
+            # Check if this event has e tags (is part of a thread)
+            e_tags = parse_e_tags(event['tags'])
+            
+            if e_tags['root'] or e_tags['reply']:
+                # This event is part of a thread, fetch full context
+                # Skip if we've already processed this thread
+                thread_root = e_tags['root'][0] if e_tags['root'] else None
+                if thread_root and thread_root in processed_threads:
+                    continue
+                
+                context_result = await fetch_event_context(
+                    event_id=event_id,
+                    fetch_events_func=fetch_nostr_events,
+                    relays=used_relays
+                )
+                
+                if context_result['success'] and context_result['thread_events']:
+                    # Mark this thread as processed
+                    if thread_root:
+                        processed_threads.add(thread_root)
+                    
+                    # Build the context content string
+                    thread_events = context_result['thread_events']
+                    
+                    # Find the root event (first in chronological order)
+                    root_event = thread_events[0] if thread_events else None
+                    
+                    # Find the original event in the thread
+                    original_event = None
+                    for te in thread_events:
+                        if te['id'] == event_id:
+                            original_event = te
+                            break
+                    
+                    # Build context content
+                    context_parts = []
+                    
+                    # Add root event
+                    if root_event:
+                        context_parts.append(f"Root event that started the thread: {root_event['content']}")
+                    
+                    # Add reply events (excluding root and original)
+                    reply_events = [te for te in thread_events if te['id'] != event_id and (not root_event or te['id'] != root_event['id'])]
+                    if reply_events:
+                        context_parts.append("Reply events:")
+                        for reply in reply_events:
+                            context_parts.append(reply['content'])
+                    
+                    # Add original event
+                    if original_event:
+                        context_parts.append(f"Original Event: {original_event['content']}")
+                    
+                    context_content = "\n".join(context_parts)
+                    
+                    # Format the event with context
+                    formatted_event = {
+                        'event_id': event_id,
+                        'event_content': event['content'],
+                        'timestamp': event['created_at'],
+                        'context_content': context_content,
+                        'thread_size': len(thread_events),
+                        'pubkey': event['pubkey'],
+                        'kind': event['kind']
+                    }
+                    formatted_events.append(formatted_event)
+            else:
+                # Standalone event without thread context
+                formatted_event = {
+                    'event_id': event_id,
+                    'event_content': event['content'],
+                    'timestamp': event['created_at'],
+                    'context_content': "Standalone event (not part of a thread)",
+                    'thread_size': 1,
+                    'pubkey': event['pubkey'],
+                    'kind': event['kind']
+                }
+                formatted_events.append(formatted_event)
+        
+        return {
+            'success': True,
+            'pubkey': hex_pubkey,
+            'since_timestamp': since,
+            'relays_used': used_relays,
+            'total_events': len(formatted_events),
+            'events': formatted_events
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in get_events_for_summary: {str(e)}")
+        return {
+            'success': False,
+            'error': str(e),
+            'events': []
+        }
 
 if __name__ == "__main__":
     mcp.run()

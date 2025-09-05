@@ -1,0 +1,100 @@
+version: 1.0.0
+title: Fetch and categorize Nostr events
+description: A recipe for fetching nostr events summary for an npub, categorize them based on in instructions and potentially summarizing them for users. 
+instructions: | 
+  Using nostrmcp, fetch and analyze Nostr events from the decentralized social protocol. Query events by kind (type), pubkey (user), or event IDs to examine social interactions, relay configurations, and protocol usage patterns. 
+
+  Present findings in structured markdown format with clear event details, timestamps, content, and tag analysis. 
+
+  Here's what you'll do: 
+  - Use the get_events_summary function to fetch all events for the npub since the given since timestamp. YOU MUST NOT FETCH MORE EVENTS IF THERE ARE NO EVENTS IN THIS TIME PERIOD.
+  - Fetch the user profile to get their details like name and profile pic. (you need to do this via get_nostr_profile function from nostr mcp ) 
+  - Add a relevancy score of 0-100 for each event based on the instruction, if an event has thread size more than 1, add score based on context_content, but you should include all events even the once that the instruction says avoid or filter out, just give them very low score. 
+  - Return a formatted output. 
+
+extensions:
+- type: stdio
+  name: nostr mcp
+  cmd: /Users/r/projects/routstr_main/nostr_mcp/.venv/bin/python
+  args:
+  - /Users/r/projects/routstr_main/nostr_mcp/nostr_mcp.py
+  timeout: 300
+  description: 'Its a nostr mcp server to fetch events and everything else. '
+
+settings:
+  goose_provider: openrouter
+  goose_model: x-ai/grok-code-fast-1
+  temperature: 0.0
+
+activities:
+- Fetch user's recent notes
+- Analyze conversation threads
+- Find outbox relay lists
+- Examine contact networks
+- Query event interactions
+
+author:
+  contact: r
+
+prompt: "User wants posts since {{ since }} described by this instruction {{ instruction }} for {{ npub }}"
+
+parameters:
+  - key: instruction
+    input_type: string
+    requirement: required
+    description: "The instruction for Nostr querying using nak"
+
+  - key: npub
+    input_type: string
+    requirement: required
+    description: "The npub we are querying"
+
+  - key: since
+    input_type: number
+    requirement: required
+    description: "The timestamp we use to fetch events, YOU MUST STICK TO IT. IF YOU DO NOT THE WORLD WILL END. Return 0 events if no events exist, DO NOT FETCH MORE EVENTS by changing this timestamp"
+
+response:
+  json_schema:
+    type: object
+    properties:
+      npub:
+        type: string
+        description: "the npub we are summarizing"
+      name: 
+        type: string
+        description: "username the npub has"
+      profile_pic:
+        type: string
+        description: "png/jpg link of the pic"
+      events:
+        type: array
+        description: "All events from the npub"
+        items:
+          type: object
+          properties:
+            event_id:
+              type: string
+              description: "Event ID"
+            event_content:
+              type: string
+              description: "Event content we fetch"
+            context_content:
+              type: string
+              description: "Event context if the event has root or reply tasks i.e., it's part of a thread"
+            context_summary:
+              type: string
+              description: "Summary of what's happening here. IMPORTANT"
+            timestamp:
+              type: number
+              description: "Timestamp of the event"
+            events_in_thread:
+              type: array
+              description: "Array of events IDs if the main event has root or reply events, else keep this list empty. "
+              items:
+                type: string
+            relevancy_score:
+              type: number
+              description: "Score of 0 - 100 for relevancy to the instruction"
+    required:
+      - events

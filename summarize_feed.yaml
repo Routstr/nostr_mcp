@@ -1,0 +1,89 @@
+version: 1.0.0
+title: Nostr feed summarizing agent
+description: A recipe for managing Nostr interactions using the nak MCP server
+instructions: |
+  You are a Nostr feed summarizing assistant using the Nostr MCP tool. 
+
+  Your primary capabilities include:
+  - Searching for posts, profiles, and events on the Nostr network
+  - Creating and publishing posts to Nostr
+  - Managing Nostr relays and connections
+  - Retrieving user profiles and metadata
+  - Exploring Nostr events and timelines
+
+  Here, your task is to:
+  - First, search for outbox relays for {{ npub }}. If it's an npub, convert it into hex format. 
+  - Fetch their kind 3 event to fetch all their followings. 
+  - Put 10 of the npubs, which are essentially all the the people the given npub is following, into the get_events_summary function in parallel to fetch all the relevant events by an npub. Do NOT summarize events by the main npub itself. 
+  - Store all responses from sub_recipes to mcp_responses folder as json in /Users/r/projects/routstr_main/nostr_mcp. name it like <npub>_<since_timestamp>_<uuid>.json {{ uuid }}
+
+extensions:
+- type: stdio
+  name: nostr mcp
+  cmd: /Users/r/projects/routstr_main/nostr_mcp/.venv/bin/python
+  args:
+  - /Users/r/projects/routstr_main/nostr_mcp/nostr_mcp.py
+  envs: {}
+  env_keys: []
+  timeout: 300
+  description: 'Its a nostr mcp server to fetch events and everything else. '
+  bundled: null
+  available_tools: []
+- type: builtin
+  name: developer
+  display_name: Developer
+  description: null
+  timeout: 300
+  bundled: true
+  available_tools: []
+
+settings:
+  goose_provider: openrouter
+  goose_model: x-ai/grok-code-fast-1
+  temperature: 0.0
+
+activities:
+- Search Nostr posts and events
+- Publish posts to Nostr
+- Retrieve user profiles
+- Explore Nostr timelines
+- Manage Nostr relays
+
+author:
+  contact: r
+
+prompt: "Your task is to summarize posts for {{ npub }} since the timestamp {{since}}"
+
+parameters:
+  - key: npub
+    input_type: string
+    requirement: required
+    description: "The npub for whom we are summarizing the feed"
+
+  - key: since
+    input_type: number
+    requirement: required
+    description: "The timestamp we use to fetch events"
+
+  - key: uuid
+    input_type: string
+    requirement: required
+    description: "UUID to name json files during response"
+
+sub_recipes:
+  - name: "summarize_and_add_relevancy_score"
+    path: "./add_relevancy_score.yaml"
+    values:
+      instruction: "Posts that contain useful information that educate me in someway or the other. Shitposting should be avoided. Low effort notes should be avoided. "
+
+response:
+  json_schema:
+    type: object
+    properties:
+      output:
+        type: array
+        description: "All followed npub summaries stored in json files. This is a list of json file paths. "
+        items:
+          type: string
+    required:
+      - output
