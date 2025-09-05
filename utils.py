@@ -268,3 +268,67 @@ def load_formatted_npub_output(npub: str, since: int, curr_timestamp: int) -> Di
            continue
 
    return {"output": output}
+
+def get_param_file_path(npub: str, since: int, curr_timestamp: int) -> str:
+    """
+    Get the path for the parameter file that tracks running commands.
+    
+    Args:
+        npub: The npub identifier
+        since: The since timestamp
+        curr_timestamp: The current timestamp
+        
+    Returns:
+        Path to the parameter file
+    """
+    base_dir = os.path.join(os.path.dirname(__file__), "running_commands")
+    os.makedirs(base_dir, exist_ok=True)
+    return os.path.join(base_dir, f"{npub}_{since}_{curr_timestamp}.json")
+
+def is_command_running(npub: str, since: int, curr_timestamp: int) -> bool:
+    """
+    Check if a command is currently running for the given parameters.
+    
+    Args:
+        npub: The npub identifier
+        since: The since timestamp
+        curr_timestamp: The current timestamp
+        
+    Returns:
+        True if command is running (parameter file exists), False otherwise
+    """
+    param_file = get_param_file_path(npub, since, curr_timestamp)
+    return os.path.exists(param_file)
+
+def mark_command_running(npub: str, since: int, curr_timestamp: int) -> None:
+    """
+    Mark a command as running by creating a parameter file.
+    
+    Args:
+        npub: The npub identifier
+        since: The since timestamp
+        curr_timestamp: The current timestamp
+    """
+    param_file = get_param_file_path(npub, since, curr_timestamp)
+    params = {
+        "npub": npub,
+        "since": since,
+        "curr_timestamp": curr_timestamp,
+        "started_at": json.dumps({"timestamp": curr_timestamp})
+    }
+    
+    with open(param_file, "w") as f:
+        json.dump(params, f, indent=2)
+
+def mark_command_completed(npub: str, since: int, curr_timestamp: int) -> None:
+    """
+    Mark a command as completed by removing the parameter file.
+    
+    Args:
+        npub: The npub identifier
+        since: The since timestamp
+        curr_timestamp: The current timestamp
+    """
+    param_file = get_param_file_path(npub, since, curr_timestamp)
+    if os.path.exists(param_file):
+        os.remove(param_file)

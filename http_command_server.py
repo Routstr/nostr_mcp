@@ -20,16 +20,33 @@ def run_command():
     try:
         print(npub, since, curr_timestamp)
         if utils.files_exist_for_timestamp(npub, since, curr_timestamp):
-            print("FILES ECIST")
+            print("FILES EXIST")
             # Files exist, return formatted output directly without running command
             formatted_result = utils.load_formatted_npub_output(npub, since, curr_timestamp)
             return jsonify(formatted_result)
     except Exception as e:
         return jsonify({"error": f"Failed to check existing files: {str(e)}"}), 500
     
-    # Files don't exist, run the command to create them
+    # Check if command is already running for these parameters
+    try:
+        if utils.is_command_running(npub, since, curr_timestamp):
+            print("COMMAND ALREADY RUNNING - returning empty JSON")
+            # Command is already running, return empty JSON
+            return jsonify({})
+    except Exception as e:
+        return jsonify({"error": f"Failed to check running commands: {str(e)}"}), 500
+    
+    # Files don't exist and no command running, run the command to create them
     cmd = f"/Users/r/projects/routstr_main/nostr_mcp/run_goose.sh {npub} {since} {curr_timestamp}"
-    print("FILES iNOT EXCIST. RUNNING new")
+    print("FILES DO NOT EXIST. RUNNING new")
+    
+    # Mark command as running before starting
+    try:
+        utils.mark_command_running(npub, since, curr_timestamp)
+        print(f"Marked command as running for {npub}_{since}_{curr_timestamp}")
+    except Exception as e:
+        return jsonify({"error": f"Failed to mark command as running: {str(e)}"}), 500
+    
     try:
         result = subprocess.run(
             cmd,
@@ -38,6 +55,10 @@ def run_command():
             text=True
         )
         print(result)
+        
+        # Mark command as completed (remove parameter file)
+        utils.mark_command_completed(npub, since, curr_timestamp)
+        print(f"Marked command as completed for {npub}_{since}_{curr_timestamp}")
         
         # If command succeeded, return formatted JSON output
         if result.returncode == 0:
@@ -55,6 +76,11 @@ def run_command():
                 "returncode": result.returncode
             })
     except Exception as e:
+        # Make sure to clean up parameter file even if an exception occurs
+        try:
+            utils.mark_command_completed(npub, since, curr_timestamp)
+        except:
+            pass  # Ignore cleanup errors in exception handling
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
