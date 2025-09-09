@@ -7,6 +7,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pynostr.key import PublicKey
 
+# Optional storage
+try:
+    from sqlite_store import get_connection, initialize_database, store_collected_data
+except Exception:
+    get_connection = None  # type: ignore
+    initialize_database = None  # type: ignore
+    store_collected_data = None  # type: ignore
+
 # Import orchestration helpers from nostr_mcp
 from nostr_mcp import fetch_nostr_events, get_events_for_summary
 
@@ -94,7 +102,11 @@ def _extract_following_from_kind3(event: Dict[str, Any]) -> List[Dict[str, str]]
     return follows
 
 
-async def collect_all_data_for_npub(npub_or_hex: str, since: Optional[int] = None) -> Dict[str, Any]:
+async def collect_all_data_for_npub(
+    npub_or_hex: str,
+    since: Optional[int] = None,
+    till: Optional[int] = None
+) -> Dict[str, Any]:
     """Collect outbox relays (kind 10002), following list (kind 3), and
     summaries for each followee via get_events_for_summary.
 
@@ -139,7 +151,7 @@ async def collect_all_data_for_npub(npub_or_hex: str, since: Optional[int] = Non
     # Build tasks to fetch summaries for each followee
     summary_tasks = []
     for f in following:
-        summary_tasks.append(get_events_for_summary(pubkey=f["hex"], since=since, relays=outbox_relays or None))
+        summary_tasks.append(get_events_for_summary(pubkey=f["hex"], since=since, relays=[f["relay_hint"]] if f.get("relay_hint") else None))
 
     summaries_results: List[Dict[str, Any]] = []
     if summary_tasks:
@@ -186,7 +198,8 @@ async def collect_all_data_for_npub(npub_or_hex: str, since: Optional[int] = Non
         "input": {
             "npub": npub,
             "hex": hex_pubkey,
-            "since": since
+            "since": since,
+            "till": till
         },
         "outbox_relays": outbox_relays,
         "following_count": len(following),
@@ -201,15 +214,29 @@ async def _main(argv: List[str]) -> int:
     parser = argparse.ArgumentParser(description="Collect Nostr data (relays, following, and summaries)")
     parser.add_argument("npub_or_hex", help="npub or hex public key")
     parser.add_argument("--since-hours", type=int, default=24, help="How many hours back to fetch (default: 24)")
+    parser.add_argument("--db", type=str, default=None, help="Optional path to sqlite database to persist results")
     args = parser.parse_args(argv)
 
     since_ts = int(time.time()) - args.since_hours * 3600
-    result = await collect_all_data_for_npub(args.npub_or_hex, since=since_ts)
+    till_ts = int(time.time())
+    result = await collect_all_data_for_npub(args.npub_or_hex, since=since_ts, till=till_ts)
     print(json.dumps(result, indent=2))
+
+    if args.db:
+        if get_connection is None or initialize_database is None or store_collected_data is None:
+            print("Warning: sqlite_store not available; skipping DB write", file=sys.stderr)
+            return 0
+        try:
+            conn = get_connection(args.db)
+            initialize_database(conn)
+            store_collected_data(conn, collected=result)
+            print(f"Stored collected data into DB: {args.db}")
+        except Exception as e:
+            print(f"Warning: failed to store collected data: {e}", file=sys.stderr)
     return 0
 
+def summarize_and_add_relevancy_score
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(_main(sys.argv[1:])))
-
 

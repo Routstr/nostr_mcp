@@ -3,3 +3,6 @@ uv.lock
 .venv
 mcp_responses
 running_commands
+.env
+keys.db
+goose.db

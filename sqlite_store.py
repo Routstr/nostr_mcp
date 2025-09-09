@@ -46,6 +46,7 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             profile_pic     TEXT,
             since           INTEGER,  -- unix timestamp; optional last stored window start
             till            INTEGER,  -- unix timestamp; optional last stored window end
+            task_id         TEXT, -- batch identifier: pubkey_since_till
             created_at      INTEGER DEFAULT (strftime('%s','now')),
             updated_at      INTEGER DEFAULT (strftime('%s','now'))
         );
@@ -63,6 +64,7 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             context_summary     TEXT,
             timestamp           INTEGER, -- unix timestamp of the event
             relevancy_score     REAL,
+            task_id             TEXT, -- batch identifier: pubkey_since_till
             created_at          INTEGER DEFAULT (strftime('%s','now')),
             updated_at          INTEGER DEFAULT (strftime('%s','now')),
             FOREIGN KEY (npub_id) REFERENCES npubs(id) ON DELETE CASCADE
@@ -101,6 +103,17 @@ def initialize_database(connection: sqlite3.Connection) -> None:
         """
     )
 
+    # API keys table
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS api_keys (
+            api_id          TEXT PRIMARY KEY,
+            api_key         TEXT NOT NULL,
+            balance         REAL NOT NULL DEFAULT 0
+        );
+        """
+    )
+
     # Helpful indexes
     cursor.execute(
         """
@@ -126,6 +139,24 @@ def initialize_database(connection: sqlite3.Connection) -> None:
     connection.commit()
 
 
+def initialize_api_keys_database(connection: sqlite3.Connection) -> None:
+    """Create only the api_keys table if it does not exist.
+
+    Use this when maintaining API keys in a separate database file.
+    """
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS api_keys (
+            api_id          TEXT PRIMARY KEY,
+            api_key         TEXT NOT NULL,
+            balance         REAL NOT NULL DEFAULT 0
+        );
+        """
+    )
+    connection.commit()
+
+
 def _touch_updated_at(connection: sqlite3.Connection, table: str, row_id: int) -> None:
     connection.execute(
         f"UPDATE {table} SET updated_at = strftime('%s','now') WHERE id = ?",
@@ -141,22 +172,23 @@ def upsert_npub(
     profile_pic: Optional[str] = None,
     since: Optional[int] = None,
     till: Optional[int] = None,
+    task_id: Optional[str] = None,
 ) -> int:
     """Insert or update a npub row and return its id.
 
     If the npub exists, updates the provided non-null fields.
     """
     cursor = connection.cursor()
-    cursor.execute("SELECT id, name, profile_pic, since, till FROM npubs WHERE npub = ?", (npub,))
+    cursor.execute("SELECT id, name, profile_pic, since, till, task_id FROM npubs WHERE npub = ?", (npub,))
     row = cursor.fetchone()
 
     if row is None:
         cursor.execute(
             """
-            INSERT INTO npubs (npub, name, profile_pic, since, till)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO npubs (npub, name, profile_pic, since, till, task_id)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (npub, name, profile_pic, since, till),
+            (npub, name, profile_pic, since, till, task_id),
         )
         npub_id = cursor.lastrowid
         connection.commit()
@@ -179,6 +211,9 @@ def upsert_npub(
     if till is not None:
         updates.append("till = ?")
         params.append(till)
+    if task_id is not None:
+        updates.append("task_id = ?")
+        params.append(task_id)
 
     if updates:
         set_clause = ", ".join(updates)
@@ -206,6 +241,7 @@ def upsert_event(
     context_summary: Optional[str] = None,
     timestamp: Optional[int] = None,
     relevancy_score: Optional[float] = None,
+    task_id: Optional[str] = None,
 ) -> int:
     """Insert or update an event row by its external event_id, return row id.
 
@@ -220,8 +256,8 @@ def upsert_event(
             """
             INSERT INTO events (
                 npub_id, event_id, event_content, context_content, context_summary,
-                timestamp, relevancy_score
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                timestamp, relevancy_score, task_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 npub_id,
@@ -231,6 +267,7 @@ def upsert_event(
                 context_summary,
                 timestamp,
                 relevancy_score,
+                task_id,
             ),
         )
         event_row_id = cursor.lastrowid
@@ -291,6 +328,7 @@ def store_npub_record_with_events(
     connection: sqlite3.Connection,
     *,
     record: Dict[str, Any],
+    task_id: Optional[str] = None,
 ) -> int:
     """Store a single npub record (and its events) shaped like the YAML schema.
 
@@ -310,6 +348,7 @@ def store_npub_record_with_events(
         profile_pic=record.get("profile_pic"),
         since=record.get("since"),
         till=record.get("till"),
+        task_id=task_id,
     )
 
     events = record.get("events") or []
@@ -325,6 +364,7 @@ def store_npub_record_with_events(
             context_summary=event.get("context_summary"),
             timestamp=event.get("timestamp"),
             relevancy_score=event.get("relevancy_score"),
+            task_id=task_id,
         )
         event_id_to_row_id[str(event.get("event_id"))] = row_id
 
@@ -428,6 +468,141 @@ def bulk_store_records(
     for record in records:
         ids.append(store_npub_record_with_events(connection, record=record))
     return ids
+
+
+def store_collected_data(
+    connection: sqlite3.Connection,
+    *,
+    collected: Dict[str, Any],
+) -> None:
+    """Persist the output of fetch_and_store.collect_all_data_for_npub.
+
+    Schema of 'collected':
+      {
+        'input': { 'npub': str, 'hex': str, 'since': int },
+        'outbox_relays': List[str],
+        'following_count': int,
+        'following': List[{ 'hex': str, 'npub': str, 'relay_hint': str }],
+        'summaries_by_hex': { hex: { 'npub': str, 'name': str, 'profile_pic': str, 'events': [...] } }
+      }
+    """
+    input_block = collected.get("input") or {}
+    root_npub: str = str(input_block.get("npub") or "")
+    root_hex: str = str(input_block.get("hex") or "")
+    since_val = input_block.get("since")
+    till_val = input_block.get("till")
+
+    # Build task_id: hex_since_till (falls back to npub if hex missing)
+    base_pub = root_hex or root_npub
+    task_id = f"{base_pub}_{since_val}_{till_val}"
+
+    # Ensure root npub exists and set last window
+    if root_npub:
+        upsert_npub(connection, npub=root_npub, since=since_val, till=till_val, task_id=task_id)
+
+    # Store summarized events per followee
+    summaries_by_hex = collected.get("summaries_by_hex") or {}
+    if isinstance(summaries_by_hex, dict):
+        for _, followee_record in summaries_by_hex.items():
+            if not isinstance(followee_record, dict):
+                continue
+            # Attach since window for informational purposes
+            followee_payload = dict(followee_record)
+            followee_payload["since"] = since_val
+            followee_payload["till"] = till_val
+            store_npub_record_with_events(connection, record=followee_payload, task_id=task_id)
+
+    connection.commit()
+
+
+def add_api_key(
+    connection: sqlite3.Connection,
+    *,
+    api_id: str,
+    api_key: str,
+    balance: float = 0.0,
+) -> None:
+    """Insert or update an API key row.
+
+    If the api_id already exists, updates api_key and balance.
+    """
+    connection.execute(
+        """
+        INSERT INTO api_keys (api_id, api_key, balance)
+        VALUES (?, ?, ?)
+        ON CONFLICT(api_id) DO UPDATE SET
+            api_key = excluded.api_key,
+            balance = excluded.balance
+        """,
+        (api_id, api_key, balance),
+    )
+    connection.commit()
+
+
+def delete_api_key(
+    connection: sqlite3.Connection,
+    *,
+    api_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> int:
+    """Delete API key rows by api_id and/or api_key.
+
+    Returns the number of deleted rows.
+    """
+    if api_id is None and api_key is None:
+        raise ValueError("Provide api_id or api_key to delete")
+
+    clauses: List[str] = []
+    params: List[Any] = []
+    if api_id is not None:
+        clauses.append("api_id = ?")
+        params.append(api_id)
+    if api_key is not None:
+        clauses.append("api_key = ?")
+        params.append(api_key)
+
+    where_clause = " AND ".join(clauses)
+    cur = connection.execute(f"DELETE FROM api_keys WHERE {where_clause}", params)
+    connection.commit()
+    return int(cur.rowcount if cur.rowcount is not None else 0)
+
+
+def fetch_api_key(
+    connection: sqlite3.Connection,
+    *,
+    api_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Fetch a single API key record by api_id or api_key.
+
+    Returns a dict like { 'api_id': str, 'api_key': str, 'balance': float }
+    or None if not found.
+    """
+    if api_id is None and api_key is None:
+        raise ValueError("Provide api_id or api_key to fetch")
+
+    clauses: List[str] = []
+    params: List[Any] = []
+    if api_id is not None:
+        clauses.append("api_id = ?")
+        params.append(api_id)
+    if api_key is not None:
+        clauses.append("api_key = ?")
+        params.append(api_key)
+
+    where_clause = " AND ".join(clauses)
+    cur = connection.execute(
+        f"SELECT api_id, api_key, balance FROM api_keys WHERE {where_clause} LIMIT 1",
+        params,
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "api_id": row["api_id"],
+        "api_key": row["api_key"],
+        "balance": float(row["balance"]),
+    }
 
 
 if __name__ == "__main__":
