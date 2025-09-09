@@ -1,0 +1,101 @@
+version: 1.0.0
+title: Nostr feed summarizing agent
+description: A recipe for managing Nostr interactions using the nak MCP server
+instructions: |
+  You are a Nostr feed summarizing assistant using the Nostr MCP tool. 
+
+  Your primary capabilities include:
+  - Searching for posts, profiles, and events on the Nostr network
+  - Creating and publishing posts to Nostr
+  - Managing Nostr relays and connections
+  - Retrieving user profiles and metadata
+  - Exploring Nostr events and timelines
+
+  Here, your task is to:
+  - First, call the fetch_and_store function to fetch all the data for the {{ npub }}. If it's an npub, convert it into hex format. 
+  - Then, call the summarize_and_add_relevancy_score function to summarize the events and add the relevancy score to the events.
+  - Return the summary of what we did in the specified format. 
+
+extensions:
+- type: stdio
+  name: nostr mcp
+  cmd: /Users/r/projects/routstr_main/nostr_mcp/.venv/bin/python
+  args:
+  - /Users/r/projects/routstr_main/nostr_mcp/nostr_mcp.py
+  envs: {}
+  env_keys: []
+  timeout: 300
+  description: 'Its a nostr mcp server to fetch events and everything else. '
+  bundled: null
+  available_tools: []
+- type: builtin
+  name: developer
+  display_name: Developer
+  description: null
+  timeout: 300
+  bundled: true
+  available_tools: []
+
+settings:
+  goose_provider: openai
+  goose_model: moonshotai/kimi-k2
+  temperature: 0.0
+
+activities:
+- Search Nostr posts and events
+- Publish posts to Nostr
+- Retrieve user profiles
+- Explore Nostr timelines
+- Manage Nostr relays
+
+author:
+  contact: r
+
+prompt: "Your task is to summarize posts for {{ npub }} since the timestamp {{since}} with till being {{ till }}. and the instruction is {{ instruction }} for the relevancy score. Add the base_dir to store the data which is {{ base_dir }}."
+
+parameters:
+  - key: npub
+    input_type: string
+    requirement: required
+    description: "The npub for whom we are summarizing the feed"
+
+  - key: since
+    input_type: number
+    requirement: required
+    description: "The timestamp we use to fetch events"
+
+  - key: till
+    input_type: number
+    requirement: required
+    description: "The till timestamp for file naming"
+  
+  - key: base_dir
+    input_type: string
+    requirement: required
+    description: "The base directory to store the data"
+
+  - key: instruction
+    input_type: string
+    requirement: required
+    description: "The instruction to summarize the events"
+
+response:
+  json_schema:
+    type: object
+    properties:
+      output:
+        type: string
+        description: "The summary of what we did"
+      success:
+        type: boolean
+        description: "Whether the operation was successful"
+      error:
+        type: string
+        description: "The error message if the operation was not successful"
+      total_events:
+        type: number
+        description: "The total number of events"
+    required:
+      - output
+      - success
+      - error

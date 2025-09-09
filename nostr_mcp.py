@@ -679,5 +679,230 @@ async def get_events_for_summary(
             'events': []
         }
 
+@mcp.tool()
+async def get_events_for_summary_multi(
+    authors: List[str],
+    since: int,
+    relays: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Fetch events for multiple authors since a timestamp.
+    
+    Returns a layers JSON where each layer corresponds to one author and
+    contains their events in the same format as `get_events_for_summary`.
+    """
+    try:
+        used_relays = relays or (MAIN_RELAYS + BACKUP_RELAYS)
+
+        # Single fetch across all authors using the authors filter
+        raw = await fetch_nostr_events(
+            authors=authors,
+            kinds=[1, 6],
+            since=since,
+            relays=used_relays
+        )
+        parsed = json.loads(raw)
+
+        if not parsed.get('success'):
+            return {
+                'success': False,
+                'error': parsed.get('error', 'Failed to fetch events'),
+                'output': []
+            }
+
+        events = parsed.get('events', [])
+
+        # Group events by author (hex pubkey)
+        events_by_pubkey: Dict[str, List[Dict[str, Any]]] = {}
+        for ev in events:
+            pk = ev.get('pubkey')
+            if not pk:
+                continue
+            events_by_pubkey.setdefault(pk, []).append(ev)
+
+        # Build layers preserving the previous shape per input author
+        layers: List[Dict[str, Any]] = []
+        for author in authors:
+            try:
+                if author.startswith('npub'):
+                    pk = PublicKey.from_npub(author)
+                    hex_author = pk.hex()
+                else:
+                    hex_author = author
+            except Exception as e:
+                layers.append({
+                    'success': False,
+                    'author_input': author,
+                    'since_timestamp': since,
+                    'error': f'Invalid author pubkey: {str(e)}',
+                    'events': [],
+                    'total_events': 0
+                })
+                continue
+
+            author_events = events_by_pubkey.get(hex_author, [])
+            layers.append({
+                'success': True,
+                'author_input': author,
+                'pubkey': hex_author,
+                'since_timestamp': since,
+                'name': '',
+                'profile_pic': '',
+                'total_events': len(author_events),
+                'events': author_events
+            })
+
+        total_events = sum(layer.get('total_events', 0) for layer in layers if layer.get('success'))
+        failed_authors = [layer.get('author_input') for layer in layers if not layer.get('success')]
+
+        return {
+            'success': True,
+            'since_timestamp': since,
+            'relays_used': used_relays,
+            'total_layers': len(layers),
+            'total_events': total_events,
+            'output': layers,
+            'failed_authors': failed_authors
+        }
+    except Exception as e:
+        logger.error(f"Error in get_events_for_summary_multi: {str(e)}")
+        return {
+            'success': False,
+            'error': str(e),
+            'output': []
+        }
+
+@mcp.tool()
+async def fetch_and_store(
+    npub_or_hex: str,
+    since: Optional[int] = None,
+    till: Optional[int] = None,
+    base_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Collect outbox relays, following, and summaries, and optionally store in SQLite.
+
+    - Collects via `fetch_and_store.collect_all_data_for_npub`.
+    - If `base_dir` is provided, writes to `<base_dir>/goose.db` using `sqlite_store`.
+    """
+    try:
+        # Import at runtime to avoid circular import during module load
+        from fetch_and_store import collect_all_data_for_npub as _collect
+
+        collected = await _collect(npub_or_hex, since=since, till=till)
+
+        db_write = False
+        db_error: Optional[str] = None
+
+        db_path: Optional[str] = None
+        if base_dir:
+            try:
+                import os as _os
+                db_path = _os.path.join(base_dir, "goose.db")
+            except Exception as e:
+                db_error = f"failed to resolve db_path from base_dir: {str(e)}"
+                db_path = None
+
+        if db_path:
+            try:
+                from sqlite_store import (
+                    get_connection,
+                    initialize_database,
+                    store_collected_data,
+                )
+            except Exception as e:
+                db_error = f"sqlite_store not available: {str(e)}"
+            else:
+                try:
+                    conn = get_connection(db_path)
+                    try:
+                        initialize_database(conn)
+                        store_collected_data(conn, collected=collected)
+                        db_write = True
+                    finally:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                except Exception as e:
+                    db_error = str(e)
+
+        # Build compact summary similar to get_events_for_summary_multi shape
+        seed_info = collected.get('input', {}) if isinstance(collected, dict) else {}
+        since_ts = seed_info.get('since')
+        summaries = collected.get('summaries_by_hex', {}) if isinstance(collected, dict) else {}
+
+        layers: List[Dict[str, Any]] = []
+        total_events = 0
+        for hex_author, data in summaries.items():
+            events_list = (data or {}).get('events', []) or []
+            layer = {
+                'success': True,
+                'author_input': (data or {}).get('npub') or hex_author,
+                'pubkey': hex_author,
+                'since_timestamp': since_ts,
+                'name': (data or {}).get('name', ''),
+                'profile_pic': (data or {}).get('profile_pic', ''),
+                'total_events': len(events_list),
+                'events': events_list,
+            }
+            total_events += len(events_list)
+            layers.append(layer)
+
+        summary_response: Dict[str, Any] = {
+            'success': True,
+            'since_timestamp': since_ts,
+            'total_events': total_events,
+            'db_path': db_path,
+            'db_write': db_write,
+        }
+        if db_error:
+            summary_response['db_error'] = db_error
+        return summary_response
+    except Exception as e:
+        logger.error(f"Error in fetch_and_store tool: {str(e)}")
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+@mcp.tool()
+async def summarize_and_add_relevancy_score(
+    instruction: str,
+    npub: str,
+    since: Optional[int] = None,
+    till: Optional[int] = None,
+    max_concurrency: int = 20,
+    base_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Summarize events and add relevancy scores for a user's events in goose.db.
+
+    Wraps `fetch_and_store.summarize_and_add_relevancy_score` in a thread.
+    """
+    try:
+        def _run() -> Dict[str, Any]:
+            from fetch_and_store import summarize_and_add_relevancy_score as _summarize
+            return _summarize(
+                instruction=instruction,
+                npub=npub,
+                since=since,
+                till=till,
+                max_concurrency=max_concurrency,
+                base_dir=base_dir,
+            )
+
+        result = await asyncio.to_thread(_run)
+        # Drop potentially large details payload from response
+        try:
+            if isinstance(result, dict) and 'details' in result:
+                result = {k: v for k, v in result.items() if k != 'details'}
+        except Exception:
+            pass
+        return result
+    except Exception as e:
+        logger.error(f"Error in summarize_and_add_relevancy_score tool: {str(e)}")
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
 if __name__ == "__main__":
     mcp.run()

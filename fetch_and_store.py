@@ -24,7 +24,7 @@ except Exception:
     fetch_api_key = None  # type: ignore
 
 # Import orchestration helpers from nostr_mcp
-from nostr_mcp import fetch_nostr_events, get_events_for_summary
+from nostr_mcp import fetch_nostr_events, get_events_for_summary_multi
 
 
 def _to_hex_pubkey(npub_or_hex: str) -> Tuple[str, str]:
@@ -156,51 +156,48 @@ async def collect_all_data_for_npub(
     except Exception:
         pass
 
-    # Build tasks to fetch summaries for each followee
-    summary_tasks = []
-    for f in following:
-        summary_tasks.append(get_events_for_summary(pubkey=f["hex"], since=since, relays=[f["relay_hint"]] if f.get("relay_hint") else None))
-
-    summaries_results: List[Dict[str, Any]] = []
-    if summary_tasks:
-        summaries_results = await asyncio.gather(*summary_tasks, return_exceptions=True)
-
-    # Helper to format a summary result to the required schema
-    def _format_summary_result(followee_hex: str, res: Any) -> Dict[str, Any]:
-        npub_value = _pubkey_to_npub(followee_hex) if followee_hex else ""
-        if isinstance(res, Exception):
-            return {
-                "npub": npub_value,
-                "name": "",
-                "profile_pic": "",
-                "events": []
-            }
-
-        events_list = []
-        try:
-            for ev in (res.get("events") or []):
-                events_list.append({
-                    "event_id": ev.get("event_id", ""),
-                    "event_content": ev.get("event_content", ""),
-                    "context_content": ev.get("context_content", ""),
-                    "timestamp": ev.get("timestamp", 0),
-                    "events_in_thread": ev.get("events_in_thread", [])
-                })
-        except Exception:
-            events_list = []
-
-        return {
-            "npub": npub_value,
-            "name": res.get("name", "") if isinstance(res, dict) else "",
-            "profile_pic": res.get("profile_pic", "") if isinstance(res, dict) else "",
-            "events": events_list
-        }
-
-    # Normalize summaries into mapping by hex pubkey with required schema
+    # Use multi-author fetch to retrieve events in a single call
     summaries_by_hex: Dict[str, Any] = {}
-    for idx, res in enumerate(summaries_results):
-        followee_hex = following[idx]["hex"] if idx < len(following) else ""
-        summaries_by_hex[followee_hex] = _format_summary_result(followee_hex, res)
+    authors: List[str] = [f.get("hex", "") for f in following if f.get("hex")]
+
+    # Use only outbox relays
+    combined_relays: List[str] = list(dict.fromkeys([r for r in outbox_relays if r]))
+
+    multi_result: Dict[str, Any] = {"success": True, "output": []}
+    if authors:
+        try:
+            multi_result = await get_events_for_summary_multi(
+                authors=authors,
+                since=since,
+                relays=combined_relays if combined_relays else None,
+            )
+        except Exception as e:
+            multi_result = {"success": False, "error": str(e), "output": []}
+
+    layers: List[Dict[str, Any]] = multi_result.get("output", []) if isinstance(multi_result, dict) else []
+
+    # Build mapping from hex pubkey to formatted summary structure
+    for layer in layers:
+        if not isinstance(layer, dict) or not layer.get("success"):
+            continue
+        hex_author = layer.get("pubkey", "")
+        if not hex_author:
+            continue
+        events_formatted: List[Dict[str, Any]] = []
+        for ev in layer.get("events", []) or []:
+            events_formatted.append({
+                "event_id": ev.get("id", ""),
+                "event_content": ev.get("content", ""),
+                "context_content": "Standalone event (not part of a thread)",
+                "timestamp": ev.get("created_at", 0),
+                "events_in_thread": [ev.get("id")] if ev.get("id") else [],
+            })
+        summaries_by_hex[hex_author] = {
+            "npub": _pubkey_to_npub(hex_author),
+            "name": layer.get("name", ""),
+            "profile_pic": layer.get("profile_pic", ""),
+            "events": events_formatted,
+        }
 
     return {
         "input": {
@@ -225,10 +222,13 @@ async def _main(argv: List[str]) -> int:
     parser.add_argument("--db", type=str, default=None, help="Optional path to sqlite database to persist results")
     args = parser.parse_args(argv)
 
+    start_time = time.time()
     since_ts = int(time.time()) - args.since_hours * 3600
     till_ts = int(time.time())
     result = await collect_all_data_for_npub(args.npub_or_hex, since=since_ts, till=till_ts)
     print(json.dumps(result, indent=2))
+    elapsed = time.time() - start_time
+    print(f"[timing] total_elapsed_seconds={elapsed:.2f}", file=sys.stderr)
 
     if args.db:
         if get_connection is None or initialize_database is None or store_collected_data is None:
@@ -248,6 +248,8 @@ def summarize_and_add_relevancy_score(
     npub: str,
     since: Optional[int] = None,
     till: Optional[int] = None,
+    max_concurrency: int = 20,
+    base_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Summarize events and add relevancy scores in goose.db for a given npub.
 
@@ -274,11 +276,11 @@ def summarize_and_add_relevancy_score(
         raise RuntimeError("sqlite storage is unavailable in this runtime")
 
     # Resolve DB paths
-    base_dir = os.path.dirname(__file__)
-    db_path = os.path.join(base_dir, "goose.db")
+    base_dir_val = base_dir or os.path.dirname(__file__)
+    db_path = os.path.join(base_dir_val, "goose.db")
 
     # Per user preference, API keys are in a separate DB (keys.db). [[memory:8544858]]
-    keys_db_path = os.path.join(base_dir, "keys.db")
+    keys_db_path = os.path.join(base_dir_val, "keys.db")
 
     # Debug: function start and DB paths
     print(
@@ -388,11 +390,10 @@ def summarize_and_add_relevancy_score(
         skipped = 0
         details: List[Dict[str, Any]] = []
 
+        # Build jobs on main thread (no DB objects in workers)
+        jobs: List[Dict[str, Any]] = []
         for ev in events:
             processed += 1
-            if processed > 5:
-                print("[summarize_and_add_relevancy_score] reached test limit of 5 events; stopping loop", flush=True)
-                break
             event_row_id = int(ev[0])
             npub_id = int(ev[1])
             event_id = str(ev[2])
@@ -424,11 +425,30 @@ def summarize_and_add_relevancy_score(
                 continue
 
             include_summary = thread_size > 1
-            messages = _build_messages(user_input, include_summary=include_summary)
+            jobs.append({
+                "event_row_id": event_row_id,
+                "npub_id": npub_id,
+                "event_id": event_id,
+                "user_input": user_input,
+                "include_summary": include_summary,
+                "thread_size": thread_size,
+            })
 
-            # Build response_format schema based on thread size
+        if not jobs:
+            return {
+                "success": True,
+                "npub": npub,
+                "processed": processed,
+                "updated": updated,
+                "skipped": skipped,
+                "details": details,
+            }
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _build_response_format(include_summary: bool) -> Dict[str, Any]:
             if include_summary:
-                response_format = {
+                return {
                     "type": "json_schema",
                     "json_schema": {
                         "name": "summary_and_relevancy",
@@ -438,20 +458,20 @@ def summarize_and_add_relevancy_score(
                             "properties": {
                                 "context_summary": {
                                     "type": "string",
-                                    "description": "Short summary (<= 280 chars) of content/thread"
+                                    "description": "Short summary (<= 280 chars) of content/thread",
                                 },
                                 "relevancy_score": {
                                     "type": "number",
-                                    "description": "Score 0-100 for relevance to the instruction"
-                                }
+                                    "description": "Score 0-100 for relevance to the instruction",
+                                },
                             },
                             "required": ["context_summary", "relevancy_score"],
-                            "additionalProperties": False
-                        }
-                    }
+                            "additionalProperties": False,
+                        },
+                    },
                 }
             else:
-                response_format = {
+                return {
                     "type": "json_schema",
                     "json_schema": {
                         "name": "relevancy_only",
@@ -461,88 +481,148 @@ def summarize_and_add_relevancy_score(
                             "properties": {
                                 "relevancy_score": {
                                     "type": "number",
-                                    "description": "Score 0-100 for relevance to the instruction"
+                                    "description": "Score 0-100 for relevance to the instruction",
                                 }
                             },
                             "required": ["relevancy_score"],
-                            "additionalProperties": False
-                        }
-                    }
+                            "additionalProperties": False,
+                        },
+                    },
                 }
 
+        def _worker(job: Dict[str, Any]) -> Dict[str, Any]:
+            user_input = job["user_input"]
+            include_summary = job["include_summary"]
+            messages = _build_messages(user_input, include_summary=include_summary)
             payload = {
                 "model": api_model,
                 "messages": messages,
                 "temperature": 0.2,
-                "response_format": response_format,
+                "response_format": _build_response_format(include_summary),
             }
             print(
-                f"[summarize_and_add_relevancy_score] ({processed}) calling LLM model={api_model} temp=0.2 format={'summary+score' if include_summary else 'score-only'} input_preview={user_input[:120].replace('\n',' ')}...",
+                f"[summarize_and_add_relevancy_score] calling LLM model={api_model} temp=0.2 format={'summary+score' if include_summary else 'score-only'} input_preview={user_input[:120].replace('\n',' ')}...",
                 flush=True,
             )
 
-            try:
-                resp = _chat_completion(payload)
-                print(f"[summarize_and_add_relevancy_score] ({processed}) resp={resp}", flush=True)
-                content_text = (
-                    ((resp.get("choices") or [{}])[0].get("message") or {}).get("content")
-                    if isinstance(resp, dict) else None
-                )
-                if not content_text:
-                    raise ValueError("Empty response from LLM")
-
-                result_obj = json.loads(content_text)
-                context_summary_val = str(result_obj.get("context_summary", "")).strip()
-                relevancy_score_val = result_obj.get("relevancy_score", None)
+            attempts = 3
+            last_error: Optional[Exception] = None
+            for attempt in range(1, attempts + 1):
                 try:
-                    relevancy_score_num = float(relevancy_score_val) if relevancy_score_val is not None else None
-                except Exception:
-                    relevancy_score_num = None
-
-                # Update event row
-                if upsert_event is None:
-                    # Fallback: direct SQL update
-                    update_fields = []
-                    update_params: List[Any] = []
-                    if context_summary_val:
-                        update_fields.append("context_summary = ?")
-                        update_params.append(context_summary_val)
-                    if relevancy_score_num is not None:
-                        update_fields.append("relevancy_score = ?")
-                        update_params.append(relevancy_score_num)
-                    if update_fields:
-                        update_sql = ", ".join(update_fields)
-                        cur.execute(f"UPDATE events SET {update_sql} WHERE id = ?", update_params + [event_row_id])
-                        connection.commit()
-                        updated += 1
-                else:
-                    upsert_event(
-                        connection,
-                        npub_id=npub_id,
-                        event_id=event_id,
-                        context_summary=context_summary_val or None,
-                        relevancy_score=relevancy_score_num,
+                    resp = _chat_completion(payload)
+                    content_text = (
+                        ((resp.get("choices") or [{}])[0].get("message") or {}).get("content")
+                        if isinstance(resp, dict) else None
                     )
-                    updated += 1
+                    if not content_text:
+                        raise ValueError("Empty response from LLM")
 
-                details.append({
-                    "event_id": event_id,
-                    "status": "updated",
-                    "thread_size": thread_size,
-                })
-                print(
-                    f"[summarize_and_add_relevancy_score] ({processed}) updated event_id={event_id} "
-                    f"score={relevancy_score_num} summary_len={len(context_summary_val)}",
-                    flush=True,
-                )
-            except Exception as e:
-                skipped += 1
-                details.append({
-                    "event_id": event_id,
-                    "status": "error",
-                    "error": str(e),
-                })
-                print(f"[summarize_and_add_relevancy_score] ({processed}) error event_id={event_id}: {e}", flush=True)
+                    result_obj = json.loads(content_text)
+                    context_summary_val = str(result_obj.get("context_summary", "")).strip()
+                    relevancy_score_val = result_obj.get("relevancy_score", None)
+                    try:
+                        relevancy_score_num = float(relevancy_score_val) if relevancy_score_val is not None else None
+                    except Exception:
+                        relevancy_score_num = None
+
+                    return {
+                        "ok": True,
+                        "event_row_id": job["event_row_id"],
+                        "npub_id": job["npub_id"],
+                        "event_id": job["event_id"],
+                        "thread_size": job["thread_size"],
+                        "context_summary": context_summary_val,
+                        "relevancy_score": relevancy_score_num,
+                    }
+                except Exception as e:
+                    last_error = e
+                    if attempt < attempts:
+                        try:
+                            time.sleep(1)
+                        except Exception:
+                            pass
+                    else:
+                        return {
+                            "ok": False,
+                            "event_row_id": job["event_row_id"],
+                            "npub_id": job["npub_id"],
+                            "event_id": job["event_id"],
+                            "thread_size": job["thread_size"],
+                            "error": str(last_error),
+                            "attempts": attempts,
+                        }
+
+        # Cap concurrency to positive integer
+        try:
+            max_workers = int(max_concurrency)
+        except Exception:
+            max_workers = 10
+        if max_workers <= 0:
+            max_workers = 1
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_job = {executor.submit(_worker, job): job for job in jobs}
+            for future in as_completed(future_to_job):
+                job = future_to_job[future]
+                event_id = job["event_id"]
+                try:
+                    result = future.result()
+                except Exception as e:
+                    skipped += 1
+                    details.append({
+                        "event_id": event_id,
+                        "status": "error",
+                        "error": str(e),
+                    })
+                    print(f"[summarize_and_add_relevancy_score] future failed for event_id={event_id}: {e}", flush=True)
+                    continue
+
+                if result.get("ok"):
+                    context_summary_val = str(result.get("context_summary") or "").strip()
+                    relevancy_score_num = result.get("relevancy_score")
+                    event_row_id = int(result["event_row_id"])  # for fallback update
+                    npub_id_val = int(result["npub_id"])  # for upsert_event path
+                    if upsert_event is None:
+                        update_fields = []
+                        update_params: List[Any] = []
+                        if context_summary_val:
+                            update_fields.append("context_summary = ?")
+                            update_params.append(context_summary_val)
+                        if relevancy_score_num is not None:
+                            update_fields.append("relevancy_score = ?")
+                            update_params.append(relevancy_score_num)
+                        if update_fields:
+                            update_sql = ", ".join(update_fields)
+                            cur.execute(f"UPDATE events SET {update_sql} WHERE id = ?", update_params + [event_row_id])
+                            connection.commit()
+                            updated += 1
+                    else:
+                        upsert_event(
+                            connection,
+                            npub_id=npub_id_val,
+                            event_id=event_id,
+                            context_summary=context_summary_val or None,
+                            relevancy_score=relevancy_score_num,
+                        )
+                        updated += 1
+
+                    details.append({
+                        "event_id": event_id,
+                        "status": "updated",
+                        "thread_size": int(result.get("thread_size") or 1),
+                    })
+                else:
+                    skipped += 1
+                    details.append({
+                        "event_id": event_id,
+                        "status": "error",
+                        "error": str(result.get("error")),
+                        "attempts": int(result.get("attempts") or 0),
+                    })
+                    print(
+                        f"[summarize_and_add_relevancy_score] error event_id={event_id}: {result.get('error')}",
+                        flush=True,
+                    )
 
         return {
             "success": True,

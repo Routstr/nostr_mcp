@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 import json
-import time
+import asyncio
 
-from fetch_and_store import summarize_and_add_relevancy_score
+from nostr_mcp import summarize_and_add_relevancy_score
 
 
 def main() -> None:
@@ -14,11 +14,17 @@ def main() -> None:
     since = 1757340914
     till = 1757427314
 
-    result = summarize_and_add_relevancy_score(
-        instruction=instruction,
-        npub=npub,
-        since=since,
-        till=till,
+    base_dir = "/Users/r/projects/routstr_main/nostr_mcp"
+
+    result = asyncio.run(
+        summarize_and_add_relevancy_score(
+            instruction=instruction,
+            npub=npub,
+            since=since,
+            till=till,
+            max_concurrency=20,
+            base_dir=base_dir,
+        )
     )
 
     print(json.dumps(result, indent=2))

@@ -126,11 +126,11 @@ async def main():
     # Test 1: Basic test with npub
     await test_get_events_for_summary()
     
-    # Test 2: Test with hex pubkey
-    await test_with_hex_pubkey()
+    # # Test 2: Test with hex pubkey
+    # await test_with_hex_pubkey()
     
-    # Test 3: Test with custom relays
-    await test_with_custom_relays()
+    # # Test 3: Test with custom relays
+    # await test_with_custom_relays()
     
     print("\n" + "=" * 60)
     print("All tests completed!")
