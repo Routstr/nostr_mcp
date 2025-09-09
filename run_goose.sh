@@ -22,4 +22,5 @@ goose run \
   --recipe summarize_feed.yaml \
   --params npub=$NPUB \
   --params since=$SINCE \
-  --params curr_timestamp=$CURR_TIMESTAMP
+  --params curr_timestamp=$CURR_TIMESTAMP \
+  --name ${NPUB}_${SINCE}_${CURR_TIMESTAMP}

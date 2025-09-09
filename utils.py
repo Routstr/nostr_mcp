@@ -6,6 +6,14 @@ import logging
 
 logger = logging.getLogger("nostr-mcp")
 
+# Import pynostr for pubkey conversion
+try:
+    from pynostr.key import PublicKey
+    PYNOSTR_AVAILABLE = True
+except ImportError:
+    PYNOSTR_AVAILABLE = False
+    logger.warning("pynostr not available, npub/hex conversion will be disabled")
+
 def parse_e_tags(event_tags: List[List[str]]) -> Dict[str, List[str]]:
     """Parse e tags from an event to extract root and reply references.
     
@@ -214,6 +222,7 @@ from glob import glob
 def files_exist_for_timestamp(npub: str, since: int, curr_timestamp: int) -> bool:
     """
     Check if files already exist for the given npub, since, and curr_timestamp.
+    Checks for both npub and converted pubkey (hex) formats.
     
     Args:
         npub: The npub identifier (main_npub)
@@ -224,22 +233,54 @@ def files_exist_for_timestamp(npub: str, since: int, curr_timestamp: int) -> boo
         True if files exist, False otherwise
     """
     base_dir = os.path.join(os.path.dirname(__file__), "mcp_responses")
-    pattern = os.path.join(
+    
+    # Check for files with npub format
+    npub_pattern = os.path.join(
         base_dir, f"*_{since}_{curr_timestamp}_{npub}.json"
     )
-    files = glob(pattern)
-    return len(files) > 0
+    npub_files = glob(npub_pattern)
+    
+    # Convert npub to hex and check for files with hex format
+    hex_files = []
+    if PYNOSTR_AVAILABLE and npub.startswith('npub'):
+        try:
+            pk = PublicKey.from_npub(npub)
+            hex_pubkey = pk.hex()
+            hex_pattern = os.path.join(
+                base_dir, f"*_{since}_{curr_timestamp}_{hex_pubkey}.json"
+            )
+            hex_files = glob(hex_pattern)
+        except Exception as e:
+            logger.warning(f"Failed to convert npub to hex for file check: {e}")
+    
+    return len(npub_files) > 0 or len(hex_files) > 0
 
 def load_formatted_npub_output(npub: str, since: int, curr_timestamp: int) -> Dict[str, Any]:
    """
    Reads all matching files from mcp_responses and converts them into the required formatted output schema.
+   Checks for both npub and converted pubkey (hex) formats.
    Skips corrupted files safely.
    """
    base_dir = os.path.join(os.path.dirname(__file__), "mcp_responses")
-   pattern = os.path.join(
+   
+   # Search for files with npub format
+   npub_pattern = os.path.join(
        base_dir, f"*_{since}_{curr_timestamp}_{npub}.json"
    )
-   files = glob(pattern)
+   files = glob(npub_pattern)
+   
+   # Convert npub to hex and search for files with hex format
+   if PYNOSTR_AVAILABLE and npub.startswith('npub'):
+       try:
+           pk = PublicKey.from_npub(npub)
+           hex_pubkey = pk.hex()
+           hex_pattern = os.path.join(
+               base_dir, f"*_{since}_{curr_timestamp}_{hex_pubkey}.json"
+           )
+           hex_files = glob(hex_pattern)
+           files.extend(hex_files)  # Combine both file lists
+       except Exception as e:
+           logger.warning(f"Failed to convert npub to hex for file loading: {e}")
 
    output = []
    for file in files:

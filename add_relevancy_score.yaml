@@ -22,7 +22,7 @@ extensions:
   description: 'Its a nostr mcp server to fetch events and everything else. '
 
 settings:
-  goose_provider: openai
+  goose_provider: openrouter
   goose_model: x-ai/grok-code-fast-1
   temperature: 0.0
 

@@ -26,7 +26,6 @@ def run_command():
             return jsonify(formatted_result)
     except Exception as e:
         return jsonify({"error": f"Failed to check existing files: {str(e)}"}), 500
-    
     # Check if command is already running for these parameters
     try:
         if utils.is_command_running(npub, since, curr_timestamp):

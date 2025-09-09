@@ -14,7 +14,7 @@ instructions: |
   Here, your task is to:
   - First, search for outbox relays for {{ npub }}. If it's an npub, convert it into hex format. 
   - Fetch their kind 3 event to fetch all their followings. 
-  - Put 10 of the npubs, which are essentially all the the people the given npub is following, into the get_events_summary function in parallel to fetch all the relevant events by an npub. Do NOT summarize events by the main npub itself. 
+  - Put 50 of the npubs, which are essentially all the the people the given npub is following, into the get_events_summary function in parallel to fetch all the relevant events by an npub. Do NOT summarize events by the main npub itself. 
   - Store all responses from sub_recipes to mcp_responses folder as json in /Users/r/projects/routstr_main/nostr_mcp. name it like <npub>_<since_timestamp>_<curr_timestamp>_<main_npub>.json
 
 extensions:
@@ -38,7 +38,7 @@ extensions:
   available_tools: []
 
 settings:
-  goose_provider: openai
+  goose_provider: openrouter
   goose_model: x-ai/grok-code-fast-1
   temperature: 0.0
 
