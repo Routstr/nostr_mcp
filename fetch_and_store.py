@@ -145,14 +145,42 @@ async def collect_all_data_for_npub(npub_or_hex: str, since: Optional[int] = Non
     if summary_tasks:
         summaries_results = await asyncio.gather(*summary_tasks, return_exceptions=True)
 
-    # Normalize summaries into mapping by hex pubkey
+    # Helper to format a summary result to the required schema
+    def _format_summary_result(followee_hex: str, res: Any) -> Dict[str, Any]:
+        npub_value = _pubkey_to_npub(followee_hex) if followee_hex else ""
+        if isinstance(res, Exception):
+            return {
+                "npub": npub_value,
+                "name": "",
+                "profile_pic": "",
+                "events": []
+            }
+
+        events_list = []
+        try:
+            for ev in (res.get("events") or []):
+                events_list.append({
+                    "event_id": ev.get("event_id", ""),
+                    "event_content": ev.get("event_content", ""),
+                    "context_content": ev.get("context_content", ""),
+                    "timestamp": ev.get("timestamp", 0),
+                    "events_in_thread": ev.get("events_in_thread", [])
+                })
+        except Exception:
+            events_list = []
+
+        return {
+            "npub": npub_value,
+            "name": res.get("name", "") if isinstance(res, dict) else "",
+            "profile_pic": res.get("profile_pic", "") if isinstance(res, dict) else "",
+            "events": events_list
+        }
+
+    # Normalize summaries into mapping by hex pubkey with required schema
     summaries_by_hex: Dict[str, Any] = {}
     for idx, res in enumerate(summaries_results):
         followee_hex = following[idx]["hex"] if idx < len(following) else ""
-        if isinstance(res, Exception):
-            summaries_by_hex[followee_hex] = {"success": False, "error": str(res)}
-        else:
-            summaries_by_hex[followee_hex] = res
+        summaries_by_hex[followee_hex] = _format_summary_result(followee_hex, res)
 
     return {
         "input": {

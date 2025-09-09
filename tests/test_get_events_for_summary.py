@@ -40,7 +40,7 @@ async def test_get_events_for_summary():
                 print("-" * 30)
                 print(f"Event ID: {event['event_id']}")
                 print(f"Timestamp: {datetime.fromtimestamp(event['timestamp']).isoformat()}")
-                print(f"Thread size: {event.get('thread_size', 1)} events")
+                print(f"Thread size: {len(event.get('events_in_thread', [])) + 1} events")
                 print(f"\nEvent Content:")
                 print(event['event_content'][:200] + "..." if len(event['event_content']) > 200 else event['event_content'])
                 print(f"\nContext Content:")

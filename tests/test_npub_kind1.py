@@ -49,7 +49,7 @@ async def test_npub_events():
                 print(f"  ID: {event['event_id']}")
                 print(f"  Kind: {event['kind']}")
                 print(f"  Content: {event['event_content'][:100]}...")
-                print(f"  Thread size: {event['thread_size']}")
+                print(f"  Thread size: {len(event.get('events_in_thread', [])) + 1}")
         else:
             print(f"❌ Error: {result['error']}")
             

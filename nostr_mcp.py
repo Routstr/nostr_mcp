@@ -536,6 +536,10 @@ async def get_events_for_summary(
         # Use provided relays or fallback to default relays
         used_relays = relays or (MAIN_RELAYS + BACKUP_RELAYS)
         
+        # Prepare profile fields; fill after fetching kind 1 if any
+        name = ""
+        profile_pic = ""
+        
         # Fetch only kind 1 events (text notes) from this user since the timestamp
         events_result = await fetch_nostr_events(
             pubkey=hex_pubkey,
@@ -617,7 +621,7 @@ async def get_events_for_summary(
                         'event_content': event['content'],
                         'timestamp': event['created_at'],
                         'context_content': context_content,
-                        'thread_size': len(thread_events),
+                        'events_in_thread': [te['id'] for te in thread_events],
                         'pubkey': event['pubkey'],
                         'kind': event['kind']
                     }
@@ -629,19 +633,42 @@ async def get_events_for_summary(
                     'event_content': event['content'],
                     'timestamp': event['created_at'],
                     'context_content': "Standalone event (not part of a thread)",
-                    'thread_size': 1,
+                    'events_in_thread': [event_id],
                     'pubkey': event['pubkey'],
                     'kind': event['kind']
                 }
                 formatted_events.append(formatted_event)
         
+        # After fetching kind 1 events, fetch metadata only if there are events
+        if events_parsed.get('events'):
+            try:
+                metadata_raw = await fetch_nostr_events(
+                    pubkey=hex_pubkey,
+                    kinds=[0],
+                    limit=1,
+                    relays=used_relays
+                )
+                metadata_parsed = json.loads(metadata_raw)
+                if metadata_parsed.get('success') and metadata_parsed.get('events'):
+                    latest_md = metadata_parsed['events'][0]
+                    try:
+                        md_content = json.loads(latest_md.get('content', '') or '{}')
+                        name = md_content.get('display_name') or md_content.get('name') or ""
+                        profile_pic = md_content.get('picture') or md_content.get('image') or ""
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
         return {
             'success': True,
             'pubkey': hex_pubkey,
             'since_timestamp': since,
             'relays_used': used_relays,
             'total_events': len(formatted_events),
-            'events': formatted_events
+            'events': formatted_events,
+            'name': name,
+            'profile_pic': profile_pic
         }
         
     except Exception as e:
