@@ -4,6 +4,7 @@ import json
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
+import logging
 
 import aiohttp
 
@@ -26,7 +27,7 @@ except Exception:
     fetch_api_key = None  # type: ignore
 
 # Import orchestration helpers from nostr_mcp
-from nostr_mcp import fetch_nostr_events, get_events_for_summary_multi
+from nostr_mcp import fetch_nostr_events, get_events_for_summary_multi, fetch_outbox_relays, get_nostr_profiles
 
 
 def _to_hex_pubkey(npub_or_hex: str) -> Tuple[str, str]:
@@ -55,33 +56,6 @@ def _pubkey_to_npub(hex_pubkey: str) -> str:
         return f"hex:{hex_pubkey}"
 
 
-def _extract_outbox_relays_from_kind10002(event: Dict[str, Any]) -> List[str]:
-    """Parse a kind 10002 event to extract outbox (write) relays.
-
-    NIP-65 specifies 'r' tags optionally annotated with 'read'/'write'. If no
-    mode is given, we include the relay as a general relay.
-    """
-    relays: List[str] = []
-    for tag in event.get("tags", []):
-        if not isinstance(tag, list) or not tag:
-            continue
-        if tag[0] != "r":
-            continue
-        # tag format: ['r', 'wss://relay', 'read'|'write'|...]
-        url = tag[1] if len(tag) > 1 else None
-        mode = tag[2] if len(tag) > 2 else None
-        if not url:
-            continue
-        if mode is None or mode.lower() == "write":
-            relays.append(url)
-    # Deduplicate while preserving order
-    seen = set()
-    ordered_unique: List[str] = []
-    for r in relays:
-        if r not in seen:
-            seen.add(r)
-            ordered_unique.append(r)
-    return ordered_unique
 
 
 def _extract_following_from_kind3(event: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -133,22 +107,13 @@ async def collect_all_data_for_npub(
 
     hex_pubkey, npub = _to_hex_pubkey(npub_or_hex)
 
-    # Fetch kind 10002 (outbox relays) and kind 3 (following) concurrently
-    kind10002_task = fetch_nostr_events(pubkey=hex_pubkey, kinds=[10002], limit=1)
+    # Fetch outbox relays (kind 10002 via helper) and kind 3 (following) concurrently
+    outbox_task = fetch_outbox_relays(hex_pubkey)
     kind3_task = fetch_nostr_events(pubkey=hex_pubkey, kinds=[3], limit=1)
-    kind10002_raw, kind3_raw = await asyncio.gather(kind10002_task, kind3_task)
+    outbox_relays, kind3_raw = await asyncio.gather(outbox_task, kind3_task)
 
     # Parse results
-    outbox_relays: List[str] = []
     following: List[Dict[str, str]] = []
-
-    try:
-        k10002_parsed = json.loads(kind10002_raw)
-        if k10002_parsed.get("success") and k10002_parsed.get("events"):
-            latest = k10002_parsed["events"][0]
-            outbox_relays = _extract_outbox_relays_from_kind10002(latest)
-    except Exception:
-        pass
 
     try:
         k3_parsed = json.loads(kind3_raw)
@@ -178,6 +143,39 @@ async def collect_all_data_for_npub(
 
     layers: List[Dict[str, Any]] = multi_result.get("output", []) if isinstance(multi_result, dict) else []
 
+    # Extract hex authors from layers and fetch their profiles
+    authors_from_layers: List[str] = []
+    for layer in layers:
+        if isinstance(layer, dict) and layer.get("success"):
+            pk = layer.get("pubkey")
+            if isinstance(pk, str) and pk:
+                authors_from_layers.append(pk)
+    # Deduplicate while preserving order
+    _seen_hex: set[str] = set()
+    authors_from_layers = [a for a in authors_from_layers if not (a in _seen_hex or _seen_hex.add(a))]
+
+    profiles_by_hex: Dict[str, Dict[str, str]] = {}
+    if authors_from_layers:
+        try:
+            profiles_json = await get_nostr_profiles(
+                pubkeys=authors_from_layers,
+                relays=combined_relays if combined_relays else None,
+            )
+            profiles_parsed = json.loads(profiles_json)
+            for p in profiles_parsed.get("profiles", []) or []:
+                if not isinstance(p, dict) or not p.get("success"):
+                    continue
+                hex_pk = p.get("pubkey")
+                prof = p.get("profile") or {}
+                if not isinstance(prof, dict):
+                    prof = {}
+                name_val = (prof.get("display_name") or prof.get("name") or "")
+                pic_val = (prof.get("picture") or prof.get("image") or "")
+                if hex_pk:
+                    profiles_by_hex[str(hex_pk)] = {"name": str(name_val or ""), "profile_pic": str(pic_val or "")}
+        except Exception:
+            pass
+
     # Build mapping from hex pubkey to formatted summary structure
     for layer in layers:
         if not isinstance(layer, dict) or not layer.get("success"):
@@ -196,8 +194,8 @@ async def collect_all_data_for_npub(
             })
         summaries_by_hex[hex_author] = {
             "npub": _pubkey_to_npub(hex_author),
-            "name": layer.get("name", ""),
-            "profile_pic": layer.get("profile_pic", ""),
+            "name": (profiles_by_hex.get(hex_author, {}) or {}).get("name", "") or layer.get("name", ""),
+            "profile_pic": (profiles_by_hex.get(hex_author, {}) or {}).get("profile_pic", "") or layer.get("profile_pic", ""),
             "events": events_formatted,
         }
 
@@ -252,6 +250,7 @@ async def summarize_and_add_relevancy_score(
     till: Optional[int] = None,
     max_concurrency: int = 20,
     base_dir: Optional[str] = None,
+    logger: Optional[logging.Logger] = None,
 ) -> Dict[str, Any]:
     """Summarize events and add relevancy scores in goose.db for a given npub.
 
@@ -271,6 +270,20 @@ async def summarize_and_add_relevancy_score(
     """
     import os
     import sqlite3
+
+    eff_logger = logger or logging.getLogger("nostr-mcp")
+    try:
+        eff_logger.info(
+            "summarize_and_add_relevancy_score core start: npub=%s, since=%s, till=%s, max_concurrency=%s, base_dir=%s, instruction_len=%d",
+            npub,
+            str(since),
+            str(till),
+            str(max_concurrency),
+            (base_dir or ""),
+            len(instruction or ""),
+        )
+    except Exception:
+        pass
 
     if get_connection is None:
         raise RuntimeError("sqlite storage is unavailable in this runtime")
@@ -329,24 +342,23 @@ async def summarize_and_add_relevancy_score(
     def _build_messages(user_input: str, include_summary: bool) -> List[Dict[str, str]]:
         if include_summary:
             system_prompt = (
-                f"{instruction}\n\n"
-                "You will receive content from a Nostr event or its thread context.\n"
+                "This is the content of a Nostr event or its thread context:"+user_input+"\n"
                 "Return a strict JSON object with keys: \n"
                 "- context_summary: short summary of the content/thread (<= 280 chars).\n"
-                "- relevancy_score: score of 0-100 indicating relevance to the instruction.\n"
+                "- relevancy_score: score of 0-100 indicating relevance to the instruction:"+instruction+"\n"
+                "- reason_for_score: reason for the score given based on the instruction \n"
                 "No additional text."
             )
         else:
             system_prompt = (
-                f"{instruction}\n\n"
-                "You will receive content from a single Nostr event (no thread context).\n"
-                "Return a strict JSON object with the single key: \n"
-                "- relevancy_score: score of 0-100 indicating relevance to the instruction.\n"
+                "This is the content of a single Nostr event (no thread context):"+user_input+"\n"
+                "Return a strict JSON object with two keys: relevancy_score and reason_for_score \n"
+                "- relevancy_score: score of 0-100 indicating relevance to the instruction: "+instruction+" \n"
+                "- reason_for_score: reason for the score given based on the instruction \n"
                 "No additional text."
             )
         return [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_input},
+            {"role": "user", "content": system_prompt}
         ]
 
     # Connect to goose.db
@@ -424,6 +436,17 @@ async def summarize_and_add_relevancy_score(
                 "include_summary": include_summary,
                 "thread_size": thread_size,
             })
+
+        try:
+            eff_logger.info(
+                "summarize_and_add_relevancy_score jobs: candidates=%d, jobs=%d, model=%s, db=%s",
+                len(events),
+                len(jobs),
+                api_model,
+                db_path,
+            )
+        except Exception:
+            pass
 
         if not jobs:
             return {
@@ -534,6 +557,16 @@ async def summarize_and_add_relevancy_score(
                             "error": str(last_error),
                             "attempts": attempts,
                         }
+            # Fallback to satisfy type checker; should be unreachable
+            return {
+                "ok": False,
+                "event_row_id": job.get("event_row_id"),
+                "npub_id": job.get("npub_id"),
+                "event_id": job.get("event_id"),
+                "thread_size": job.get("thread_size", 1),
+                "error": "Unknown failure",
+                "attempts": 0,
+            }
 
         # Cap concurrency to positive integer
         try:
@@ -609,7 +642,7 @@ async def summarize_and_add_relevancy_score(
                         "attempts": int(result.get("attempts") or 0),
                     })
 
-        return {
+        result_payload = {
             "success": True,
             "npub": npub,
             "processed": processed,
@@ -617,6 +650,17 @@ async def summarize_and_add_relevancy_score(
             "skipped": skipped,
             "details": details,
         }
+        try:
+            eff_logger.info(
+                "summarize_and_add_relevancy_score result: processed=%d, updated=%d, skipped=%d, details_len=%d",
+                processed,
+                updated,
+                skipped,
+                len(details),
+            )
+        except Exception:
+            pass
+        return result_payload
     finally:
         try:
             connection.close()

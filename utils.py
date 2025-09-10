@@ -41,6 +41,42 @@ def parse_e_tags(event_tags: List[List[str]]) -> Dict[str, List[str]]:
     
     return e_tags
 
+
+def _extract_outbox_relays_from_kind10002(event: Dict[str, Any], include_onion: bool = False) -> List[str]:
+    """Parse a kind 10002 event to extract outbox (write) relays.
+
+    NIP-65 specifies 'r' tags optionally annotated with 'read'/'write'. If no
+    mode is given, we include the relay as a general relay.
+    """
+    relays: List[str] = []
+    for tag in event.get("tags", []):
+        if not isinstance(tag, list) or not tag:
+            continue
+        if tag[0] != "r":
+            continue
+        # tag format: ['r', 'wss://relay', 'read'|'write'|...]
+        url = tag[1] if len(tag) > 1 else None
+        mode = tag[2] if len(tag) > 2 else None
+        if not url:
+            continue
+        # Filter out .onion relays unless explicitly included
+        if not include_onion:
+            try:
+                if ".onion" in str(url).lower():
+                    continue
+            except Exception:
+                pass
+        if mode is None or str(mode).lower() == "write":
+            relays.append(url)
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    ordered_unique: List[str] = []
+    for r in relays:
+        if r not in seen:
+            seen.add(r)
+            ordered_unique.append(r)
+    return ordered_unique
+
 async def fetch_event_context(
     event_id: str,
     fetch_events_func,
@@ -352,30 +388,30 @@ def get_param_file_path(npub: str, since: int, curr_timestamp: int) -> str:
 def _get_db_connection(db_path: Optional[str] = None):
     return sqlite_store.get_connection(db_path or 'goose.db')
 
-def is_command_running(
+def get_job_status(
     npub: str, since: int, curr_timestamp: int, db_path: Optional[str] = None
-) -> bool:
+) -> Optional[str]:
     """
-    Check if a job is running/queued for the given parameters in the database.
-    Optionally specify a custom SQLite database path.
+    Return the most recent job status for (npub, since, till=curr_timestamp),
+    or None if no job exists. Optionally specify DB path.
     """
     try:
         conn = _get_db_connection(db_path)
         cur = conn.execute(
             """
-            SELECT j.id
+            SELECT j.status
             FROM jobs j
             JOIN npubs n ON n.id = j.npub_id
             WHERE n.npub = ? AND j.since = ? AND j.till = ?
-              AND j.status IN ('queued','running')
+            ORDER BY j.id DESC
             LIMIT 1
             """,
             (npub, since, curr_timestamp),
         )
-        return cur.fetchone() is not None
+        row = cur.fetchone()
+        return str(row[0]) if row is not None else None
     except Exception:
-        # If DB/tables aren't ready, assume not running
-        return False
+        return None
 
 def mark_command_running(
     npub: str, since: int, curr_timestamp: int, db_path: Optional[str] = None

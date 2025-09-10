@@ -6,3 +6,4 @@ running_commands
 .env
 keys.db
 goose.db
+logs/

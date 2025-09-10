@@ -4,8 +4,9 @@ import asyncio
 import json
 import time
 import uuid
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, cast
 import logging
+from datetime import datetime
 
 from mcp.server.fastmcp import FastMCP
 from pynostr.event import Event, EventKind
@@ -13,7 +14,7 @@ from pynostr.relay_manager import RelayManager
 from pynostr.filters import FiltersList, Filters
 from pynostr.key import PrivateKey, PublicKey
 from dotenv import load_dotenv
-from utils import fetch_event_context, summarize_thread_context, parse_e_tags
+from utils import fetch_event_context, summarize_thread_context, parse_e_tags, _extract_outbox_relays_from_kind10002
 
 # Load environment variables
 load_dotenv()
@@ -24,9 +25,33 @@ BACKUP_RELAYS = os.environ.get("BACKUP_RELAYS", "wss://multiplexer.huszonegy.wor
 NOSTR_BOT_NSEC = os.environ.get("NOSTR_BOT_NSEC")
 DEFAULT_TIMEOUT = int(os.environ.get("NOSTR_TIMEOUT", "10"))
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+# Set up logging: write to logs/YYYY-MM-DD.log and console
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOGS_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOGS_DIR, exist_ok=True)
+
+today_str = datetime.now().strftime("%Y-%m-%d")
+log_file_path = os.path.join(LOGS_DIR, f"{today_str}.log")
+
 logger = logging.getLogger("nostr-mcp")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+if not logger.handlers:
+    formatter = logging.Formatter(
+        fmt="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = logging.FileHandler(log_file_path)
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
 
 # Create the FastMCP instance
 mcp = FastMCP("nostr-mcp")
@@ -223,7 +248,7 @@ async def publish_nostr_event(
             try:
                 # Parse private key
                 try:
-                    private_key = PrivateKey.from_nsec(NOSTR_BOT_NSEC)
+                    private_key = PrivateKey.from_nsec(cast(str, NOSTR_BOT_NSEC))
                 except ValueError as e:
                     return {
                         'success': False,
@@ -295,64 +320,142 @@ async def publish_nostr_event(
         })
 
 @mcp.tool()
-async def get_nostr_profile(pubkey: str, relays: Optional[List[str]] = None) -> str:
-    """Fetch a Nostr user's profile metadata."""
+async def get_nostr_profiles(pubkeys: List[str], relays: Optional[List[str]] = None) -> str:
+    """Fetch Nostr user profile metadata for multiple pubkeys.
+
+    Args:
+        pubkeys: List of public keys in npub or hex format
+        relays: Optional list of relay URLs to query
+
+    Returns:
+        JSON string with a list under 'profiles', preserving input order.
+    """
     try:
-        # Convert pubkey format if needed
-        try:
-            if pubkey.startswith('npub'):
-                pk = PublicKey.from_npub(pubkey)
-                hex_pubkey = pk.hex()
-            else:
-                hex_pubkey = pubkey
-        except Exception as e:
-            return json.dumps({"error": f"Invalid pubkey format: {str(e)}"})
-        
-        # Fetch kind 0 (metadata) events for this pubkey
-        result = await fetch_nostr_events(
-            pubkey=hex_pubkey,
-            kinds=[0],  # Metadata events
-            limit=1,
+        # Normalize inputs to hex and retain mapping and per-input errors
+        inputs: List[Dict[str, Any]] = []
+        processed_authors: List[str] = []
+
+        for original in pubkeys:
+            entry: Dict[str, Any] = {'input': original}
+            try:
+                if isinstance(original, str) and original.startswith('npub'):
+                    pk = PublicKey.from_npub(original)
+                    hex_pk = pk.hex()
+                    entry['pubkey'] = hex_pk
+                else:
+                    # Basic validation for hex length; detailed errors will surface later if invalid
+                    hex_pk = original
+                    entry['pubkey'] = hex_pk
+                processed_authors.append(hex_pk)
+            except Exception as e:
+                entry['error'] = f'Invalid pubkey format: {str(e)}'
+            inputs.append(entry)
+
+        # If none are valid, short-circuit
+        if not processed_authors:
+            return json.dumps({
+                'success': True,
+                'count': 0,
+                'profiles': [
+                    {
+                        'success': False,
+                        'input': it.get('input'),
+                        'error': it.get('error', 'Invalid pubkey')
+                    } for it in inputs
+                ]
+            }, indent=2)
+
+        # Fetch kind 0 metadata for all authors at once
+        raw = await fetch_nostr_events(
+            authors=processed_authors,
+            kinds=[0],
             relays=relays
         )
-        
-        parsed_result = json.loads(result)
-        
-        if not parsed_result['success'] or not parsed_result['events']:
+
+        parsed = json.loads(raw)
+        if not parsed.get('success'):
             return json.dumps({
                 'success': False,
-                'error': 'No profile found for this pubkey',
-                'pubkey': pubkey
+                'error': parsed.get('error', 'Failed to fetch metadata'),
+                'profiles': []
+            }, indent=2)
+
+        events = parsed.get('events', []) or []
+
+        # Take the newest metadata per pubkey (events are already sorted newest-first)
+        latest_by_pubkey: Dict[str, Dict[str, Any]] = {}
+        for ev in events:
+            pk_hex = ev.get('pubkey')
+            if not pk_hex:
+                continue
+            if pk_hex not in latest_by_pubkey:
+                latest_by_pubkey[pk_hex] = ev
+
+        outputs: List[Dict[str, Any]] = []
+        for it in inputs:
+            original = it.get('input')
+            hex_pk = it.get('pubkey')
+            prior_err = it.get('error')
+
+            if prior_err or not hex_pk:
+                outputs.append({
+                    'success': False,
+                    'input': original,
+                    'error': prior_err or 'Invalid pubkey'
+                })
+                continue
+
+            ev = latest_by_pubkey.get(hex_pk)
+            if not ev:
+                # Provide npub conversion if possible even when not found
+                try:
+                    npub_format = PublicKey(bytes.fromhex(hex_pk)).npub
+                except Exception:
+                    npub_format = f'hex:{hex_pk}'
+                outputs.append({
+                    'success': False,
+                    'input': original,
+                    'pubkey': hex_pk,
+                    'npub': npub_format,
+                    'error': 'No profile found for this pubkey'
+                })
+                continue
+
+            # Parse profile content
+            content = ev.get('content', '') or ''
+            try:
+                profile_data = json.loads(content)
+            except json.JSONDecodeError:
+                profile_data = {'raw_content': content}
+
+            # Convert back to npub for convenience
+            try:
+                npub_format = PublicKey(bytes.fromhex(hex_pk)).npub
+            except Exception:
+                npub_format = f'hex:{hex_pk}'
+
+            outputs.append({
+                'success': True,
+                'input': original,
+                'pubkey': hex_pk,
+                'npub': npub_format,
+                'profile': profile_data,
+                'last_updated': ev.get('created_at'),
+                'event_id': ev.get('id')
             })
-        
-        # Parse the metadata
-        metadata_event = parsed_result['events'][0]
-        try:
-            profile_data = json.loads(metadata_event['content'])
-        except json.JSONDecodeError:
-            profile_data = {'raw_content': metadata_event['content']}
-        
-        # Convert hex pubkey back to npub format
-        try:
-            pk_for_npub = PublicKey(bytes.fromhex(hex_pubkey))
-            npub_format = pk_for_npub.npub
-        except Exception as npub_error:
-            # Fallback if npub conversion fails
-            npub_format = f"hex:{hex_pubkey}"
-        
+
         return json.dumps({
             'success': True,
-            'pubkey': hex_pubkey,
-            'npub': npub_format,
-            'profile': profile_data,
-            'last_updated': metadata_event['created_at'],
-            'event_id': metadata_event['id']
+            'count': len(outputs),
+            'profiles': outputs,
+            'relays_used': parsed.get('relays_used')
         }, indent=2)
-        
+
     except Exception as e:
         return json.dumps({
             'success': False,
-            'error': f"Unexpected error: {str(e)}"
+            'error': f"Unexpected error: {str(e)}",
+            'profiles': []
         })
 
 @mcp.tool()
@@ -386,6 +489,35 @@ async def search_nostr_content(
             'events': [],
             'count': 0
         })
+
+@mcp.tool()
+async def fetch_outbox_relays(pubkey: str) -> List[str]:
+    """Return outbox (write) relays from user's kind 10002 event.
+
+    Args:
+        pubkey: npub or hex public key
+
+    Returns:
+        List of relay URLs (strings). Empty list if none or on error.
+    """
+    try:
+        hex_pubkey = pubkey
+        if pubkey.startswith('npub'):
+            try:
+                pk = PublicKey.from_npub(pubkey)
+                hex_pubkey = pk.hex()
+            except Exception:
+                return []
+
+        raw = await fetch_nostr_events(pubkey=hex_pubkey, kinds=[10002], limit=1)
+        parsed = json.loads(raw)
+        if not parsed.get('success') or not parsed.get('events'):
+            return []
+        latest = parsed['events'][0]
+        relays = _extract_outbox_relays_from_kind10002(latest)
+        return relays
+    except Exception:
+        return []
 
 @mcp.tool()
 async def convert_pubkey_format(pubkeys: List[str]) -> str:
@@ -696,7 +828,7 @@ async def get_events_for_summary_multi(
         # Single fetch across all authors using the authors filter
         raw = await fetch_nostr_events(
             authors=authors,
-            kinds=[1, 6],
+            kinds=[1],
             since=since,
             relays=used_relays
         )
@@ -784,10 +916,43 @@ async def fetch_and_store(
     - If `base_dir` is provided, writes to `<base_dir>/goose.db` using `sqlite_store`.
     """
     try:
+        logger.info(
+            f"fetch_and_store start: npub_or_hex={npub_or_hex}, since={since}, till={till}, base_dir={(base_dir or '')}"
+        )
         # Import at runtime to avoid circular import during module load
         from fetch_and_store import collect_all_data_for_npub as _collect
 
         collected = await _collect(npub_or_hex, since=since, till=till)
+
+        # Log concise metrics (no large payloads)
+        try:
+            seed_info_safe = collected.get('input', {}) if isinstance(collected, dict) else {}
+            since_ts_safe = seed_info_safe.get('since')
+            till_ts_safe = seed_info_safe.get('till')
+            relays_list_safe = collected.get('outbox_relays', []) if isinstance(collected, dict) else []
+            follows_count_safe = int(collected.get('following_count', 0)) if isinstance(collected, dict) else 0
+            follows_list_safe = collected.get('following', []) if isinstance(collected, dict) else []
+            summaries_safe = collected.get('summaries_by_hex', {}) if isinstance(collected, dict) else {}
+            authors_with_summaries = len(summaries_safe) if isinstance(summaries_safe, dict) else 0
+            total_events_safe = 0
+            if isinstance(summaries_safe, dict):
+                for v in summaries_safe.values():
+                    try:
+                        total_events_safe += len((v or {}).get('events', []) or [])
+                    except Exception:
+                        pass
+            logger.info(
+                "fetch_and_store metrics: since=%s, till=%s, relays=%d, follows=%d (list_len=%d), authors_with_summaries=%d, total_events=%d",
+                since_ts_safe,
+                till_ts_safe,
+                len(relays_list_safe),
+                follows_count_safe,
+                len(follows_list_safe) if isinstance(follows_list_safe, list) else 0,
+                authors_with_summaries,
+                total_events_safe,
+            )
+        except Exception as _log_err:
+            logger.warning(f"fetch_and_store metrics logging failed: {str(_log_err)}")
 
         db_write = False
         db_error: Optional[str] = None
@@ -824,6 +989,14 @@ async def fetch_and_store(
                             pass
                 except Exception as e:
                     db_error = str(e)
+
+        # DB write summary (no large payloads)
+        logger.info(
+            "fetch_and_store DB: path=%s, wrote=%s, had_error=%s",
+            db_path,
+            str(db_write),
+            str(bool(db_error)),
+        )
 
         # Build compact summary similar to get_events_for_summary_multi shape
         seed_info = collected.get('input', {}) if isinstance(collected, dict) else {}
@@ -878,6 +1051,16 @@ async def summarize_and_add_relevancy_score(
     Runs inline without threading to avoid MCP transport issues.
     """
     try:
+        # Start log with concise parameters (avoid large payloads)
+        logger.info(
+            "summarize_and_add_relevancy_score start: npub=%s, since=%s, till=%s, max_concurrency=%s, base_dir=%s, instruction_len=%d",
+            npub,
+            str(since),
+            str(till),
+            str(max_concurrency),
+            (base_dir or ""),
+            len(instruction or ""),
+        )
         # Import the function directly and run it in the current context
         # This avoids any threading issues with the MCP transport layer
         from fetch_and_store import summarize_and_add_relevancy_score as _summarize
@@ -890,8 +1073,26 @@ async def summarize_and_add_relevancy_score(
             till=till,
             max_concurrency=max_concurrency,
             base_dir=base_dir,
+            logger=logger,
         )
-        
+        # Log concise metrics from result
+        try:
+            success_safe = bool(result.get('success')) if isinstance(result, dict) else False
+            processed_safe = int(result.get('processed', 0)) if isinstance(result, dict) else 0
+            updated_safe = int(result.get('updated', 0)) if isinstance(result, dict) else 0
+            skipped_safe = int(result.get('skipped', 0)) if isinstance(result, dict) else 0
+            details_len_safe = len(result.get('details', []) or []) if isinstance(result, dict) else 0
+            logger.info(
+                "summarize_and_add_relevancy_score metrics: success=%s, processed=%d, updated=%d, skipped=%d, details_len=%d",
+                str(success_safe),
+                processed_safe,
+                updated_safe,
+                skipped_safe,
+                details_len_safe,
+            )
+        except Exception as _log_err:
+            logger.warning(f"summarize_and_add_relevancy_score metrics logging failed: {str(_log_err)}")
+
         return result
     except Exception as e:
         logger.error(f"Error in summarize_and_add_relevancy_score tool: {str(e)}")

@@ -9,18 +9,22 @@ set -e
 
 cd /Users/r/projects/routstr_main/nostr_mcp
 
-if [ "$#" -ne 3 ]; then
-  echo "Usage: $0 <npub> <since> <curr_timestamp>"
+if [ "$#" -ne 5 ]; then
+  echo "Usage: $0 <npub> <since> <curr_timestamp> <instruction> <base_dir>"
   exit 1
 fi
 
 NPUB=$1
 SINCE=$2
 CURR_TIMESTAMP=$3
+INSTRUCTION=$4
+BASE_DIR=$5
 
 goose run \
-  --recipe summarize_feed.yaml \
-  --params npub=$NPUB \
-  --params since=$SINCE \
-  --params curr_timestamp=$CURR_TIMESTAMP \
-  --name ${NPUB}_${SINCE}_${CURR_TIMESTAMP}
+  --recipe db_powered_summarize.yaml \
+  --params "npub=$NPUB" \
+  --params "since=$SINCE" \
+  --params "till=$CURR_TIMESTAMP" \
+  --params "base_dir=$BASE_DIR" \
+  --params "instruction=$INSTRUCTION" \
+  --name "${NPUB}_${SINCE}_${CURR_TIMESTAMP}"

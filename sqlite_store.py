@@ -58,7 +58,7 @@ def initialize_database(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS events (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
             npub_id             INTEGER NOT NULL,
-            event_id            TEXT NOT NULL UNIQUE,
+            event_id            TEXT NOT NULL,
             event_content       TEXT,
             context_content     TEXT,
             context_summary     TEXT,
