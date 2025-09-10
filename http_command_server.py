@@ -55,18 +55,23 @@ def run_command():
         )
         print(result)
         
-        # Mark command as completed (remove parameter file)
-        utils.mark_command_completed(npub, since, curr_timestamp)
-        print(f"Marked command as completed for {npub}_{since}_{curr_timestamp}")
-        
         # If command succeeded, return formatted JSON output
         if result.returncode == 0:
+            utils.mark_command_completed(npub, since, curr_timestamp)
+            print(f"Marked command as completed for {npub}_{since}_{curr_timestamp}")
             try:
                 formatted_result = utils.load_formatted_npub_output(npub, since, curr_timestamp)
                 return jsonify(formatted_result)
             except Exception as e:
                 return jsonify({"error": f"Failed to format output: {str(e)}"}), 500
         else:
+            try:
+                utils.mark_command_failed(
+                    npub, since, curr_timestamp,
+                    f"returncode={result.returncode}, stderr={result.stderr[:1000]}"
+                )
+            except Exception:
+                pass
             # If command failed, return the original error output
             return jsonify({
                 "cmd": cmd,
@@ -75,11 +80,13 @@ def run_command():
                 "returncode": result.returncode
             })
     except Exception as e:
-        # Make sure to clean up parameter file even if an exception occurs
+        # Record failure for the job
         try:
-            utils.mark_command_completed(npub, since, curr_timestamp)
-        except:
-            pass  # Ignore cleanup errors in exception handling
+            utils.mark_command_failed(
+                npub, since, curr_timestamp, f"exception: {str(e)[:1000]}"
+            )
+        except Exception:
+            pass
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":

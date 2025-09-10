@@ -218,96 +218,119 @@ def summarize_thread_context(context_result: Dict[str, Any]) -> str:
 
 import os
 from glob import glob
+import sqlite_store
 
-def files_exist_for_timestamp(npub: str, since: int, curr_timestamp: int) -> bool:
-    """
-    Check if files already exist for the given npub, since, and curr_timestamp.
-    Checks for both npub and converted pubkey (hex) formats.
-    
-    Args:
-        npub: The npub identifier (main_npub)
-        since: The since timestamp
-        curr_timestamp: The current timestamp
-        
-    Returns:
-        True if files exist, False otherwise
-    """
-    base_dir = os.path.join(os.path.dirname(__file__), "mcp_responses")
-    
-    # Check for files with npub format
-    npub_pattern = os.path.join(
-        base_dir, f"*_{since}_{curr_timestamp}_{npub}.json"
-    )
-    npub_files = glob(npub_pattern)
-    
-    # Convert npub to hex and check for files with hex format
-    hex_files = []
+def _compute_task_id_candidates(npub: str, since: int, till: int) -> List[str]:
+    candidates: List[str] = []
     if PYNOSTR_AVAILABLE and npub.startswith('npub'):
         try:
             pk = PublicKey.from_npub(npub)
             hex_pubkey = pk.hex()
-            hex_pattern = os.path.join(
-                base_dir, f"*_{since}_{curr_timestamp}_{hex_pubkey}.json"
-            )
-            hex_files = glob(hex_pattern)
+            candidates.append(f"{hex_pubkey}_{since}_{till}")
         except Exception as e:
-            logger.warning(f"Failed to convert npub to hex for file check: {e}")
-    
-    return len(npub_files) > 0 or len(hex_files) > 0
+            logger.warning(f"Failed to convert npub to hex for task_id: {e}")
+    candidates.append(f"{npub}_{since}_{till}")
+    # Deduplicate preserving order
+    seen = set()
+    unique = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            unique.append(c)
+    return unique
 
-def load_formatted_npub_output(npub: str, since: int, curr_timestamp: int) -> Dict[str, Any]:
+
+def files_exist_for_timestamp(
+    npub: str, since: int, curr_timestamp: int, db_path: Optional[str] = None
+) -> bool:
+    """
+    Check if any events exist in the DB for (npub, since, till=curr_timestamp).
+    Uses task_id candidates based on npub and its hex.
+    """
+    try:
+        conn = _get_db_connection(db_path)
+        task_ids = _compute_task_id_candidates(npub, since, curr_timestamp)
+        qmarks = ",".join(["?"] * len(task_ids))
+        cur = conn.execute(
+            f"SELECT 1 FROM events WHERE task_id IN ({qmarks}) LIMIT 1",
+            task_ids,
+        )
+        return cur.fetchone() is not None
+    except Exception as e:
+        logger.warning(f"DB check for existing events failed: {e}")
+        return False
+
+def load_formatted_npub_output(
+    npub: str, since: int, curr_timestamp: int, db_path: Optional[str] = None
+) -> Dict[str, Any]:
    """
-   Reads all matching files from mcp_responses and converts them into the required formatted output schema.
-   Checks for both npub and converted pubkey (hex) formats.
-   Skips corrupted files safely.
+   Load formatted output from the database for all events with matching task_id
+   (npub or its hex) for the (since, till=curr_timestamp) window.
    """
-   base_dir = os.path.join(os.path.dirname(__file__), "mcp_responses")
-   
-   # Search for files with npub format
-   npub_pattern = os.path.join(
-       base_dir, f"*_{since}_{curr_timestamp}_{npub}.json"
+   conn = _get_db_connection(db_path)
+   task_ids = _compute_task_id_candidates(npub, since, curr_timestamp)
+   qmarks = ",".join(["?"] * len(task_ids))
+
+   cur = conn.execute(
+       f"""
+       SELECT
+           e.id                AS event_row_id,
+           e.event_id          AS event_id,
+           e.event_content     AS event_content,
+           e.context_content   AS context_content,
+           e.context_summary   AS context_summary,
+           e.timestamp         AS timestamp,
+           e.relevancy_score   AS relevancy_score,
+           n.npub              AS npub,
+           n.name              AS name,
+           n.profile_pic       AS profile_pic
+       FROM events e
+       JOIN npubs n ON n.id = e.npub_id
+       WHERE e.task_id IN ({qmarks})
+       ORDER BY n.npub, e.timestamp ASC
+       """,
+       task_ids,
    )
-   files = glob(npub_pattern)
-   
-   # Convert npub to hex and search for files with hex format
-   if PYNOSTR_AVAILABLE and npub.startswith('npub'):
-       try:
-           pk = PublicKey.from_npub(npub)
-           hex_pubkey = pk.hex()
-           hex_pattern = os.path.join(
-               base_dir, f"*_{since}_{curr_timestamp}_{hex_pubkey}.json"
-           )
-           hex_files = glob(hex_pattern)
-           files.extend(hex_files)  # Combine both file lists
-       except Exception as e:
-           logger.warning(f"Failed to convert npub to hex for file loading: {e}")
 
-   output = []
-   for file in files:
-       try:
-           with open(file, "r") as f:
-               data = json.load(f)
-           npub_summary = {
-               "npub": data.get("npub", ""),
-               "name": data.get("name", ""),
-               "profile_pic": data.get("profile_pic", ""),
-               "events": []
+   rows = cur.fetchall() or []
+   grouped: Dict[str, Dict[str, Any]] = {}
+
+   for row in rows:
+       npub_key = row["npub"] or ""
+       bucket = grouped.get(npub_key)
+       if bucket is None:
+           bucket = {
+               "npub": npub_key,
+               "name": row["name"] or "",
+               "profile_pic": row["profile_pic"] or "",
+               "events": [],
            }
-           for ev in data.get("events", []):
-               npub_summary["events"].append({
-                   "event_id": ev.get("event_id", ""),
-                   "event_content": ev.get("event_content", ""),
-                   "context_content": ev.get("context_content", ""),
-                   "context_summary": ev.get("context_summary", ""),
-                   "timestamp": ev.get("timestamp", 0),
-                   "relevancy_score": ev.get("relevancy_score", 0),
-                   "events_in_thread": ev.get("events_in_thread", []),
-               })
-           output.append(npub_summary)
-       except Exception as e:
-           logger.warning(f"Skipping corrupted file {file}: {e}")
-           continue
+           grouped[npub_key] = bucket
 
+       # Fetch related event external ids for thread links
+       rel_cur = conn.execute(
+           """
+           SELECT e2.event_id
+           FROM event_thread_links l
+           JOIN events e2 ON e2.id = l.related_event_id
+           WHERE l.event_id = ?
+           """,
+           (row["event_row_id"],),
+       )
+       related_ids = [r[0] for r in (rel_cur.fetchall() or [])]
+
+       bucket["events"].append({
+           "event_id": row["event_id"] or "",
+           "event_content": row["event_content"] or "",
+           "context_content": row["context_content"] or "",
+           "context_summary": row["context_summary"] or "",
+           "timestamp": int(row["timestamp"]) if row["timestamp"] is not None else 0,
+           "relevancy_score": float(row["relevancy_score"]) if row["relevancy_score"] is not None else 0.0,
+           "events_in_thread": related_ids,
+       })
+
+   # Preserve deterministic order by npub key
+   output = [grouped[k] for k in sorted(grouped.keys())]
    return {"output": output}
 
 def get_param_file_path(npub: str, since: int, curr_timestamp: int) -> str:
@@ -326,50 +349,129 @@ def get_param_file_path(npub: str, since: int, curr_timestamp: int) -> str:
     os.makedirs(base_dir, exist_ok=True)
     return os.path.join(base_dir, f"{npub}_{since}_{curr_timestamp}.json")
 
-def is_command_running(npub: str, since: int, curr_timestamp: int) -> bool:
-    """
-    Check if a command is currently running for the given parameters.
-    
-    Args:
-        npub: The npub identifier
-        since: The since timestamp
-        curr_timestamp: The current timestamp
-        
-    Returns:
-        True if command is running (parameter file exists), False otherwise
-    """
-    param_file = get_param_file_path(npub, since, curr_timestamp)
-    return os.path.exists(param_file)
+def _get_db_connection(db_path: Optional[str] = None):
+    return sqlite_store.get_connection(db_path or 'goose.db')
 
-def mark_command_running(npub: str, since: int, curr_timestamp: int) -> None:
+def is_command_running(
+    npub: str, since: int, curr_timestamp: int, db_path: Optional[str] = None
+) -> bool:
     """
-    Mark a command as running by creating a parameter file.
-    
-    Args:
-        npub: The npub identifier
-        since: The since timestamp
-        curr_timestamp: The current timestamp
+    Check if a job is running/queued for the given parameters in the database.
+    Optionally specify a custom SQLite database path.
     """
-    param_file = get_param_file_path(npub, since, curr_timestamp)
-    params = {
-        "npub": npub,
-        "since": since,
-        "curr_timestamp": curr_timestamp,
-        "started_at": json.dumps({"timestamp": curr_timestamp})
-    }
-    
-    with open(param_file, "w") as f:
-        json.dump(params, f, indent=2)
+    try:
+        conn = _get_db_connection(db_path)
+        cur = conn.execute(
+            """
+            SELECT j.id
+            FROM jobs j
+            JOIN npubs n ON n.id = j.npub_id
+            WHERE n.npub = ? AND j.since = ? AND j.till = ?
+              AND j.status IN ('queued','running')
+            LIMIT 1
+            """,
+            (npub, since, curr_timestamp),
+        )
+        return cur.fetchone() is not None
+    except Exception:
+        # If DB/tables aren't ready, assume not running
+        return False
 
-def mark_command_completed(npub: str, since: int, curr_timestamp: int) -> None:
+def mark_command_running(
+    npub: str, since: int, curr_timestamp: int, db_path: Optional[str] = None
+) -> None:
     """
-    Mark a command as completed by removing the parameter file.
-    
-    Args:
-        npub: The npub identifier
-        since: The since timestamp
-        curr_timestamp: The current timestamp
+    Mark a job as running in the database for (npub, since, till=curr_timestamp).
+    Creates a job if missing or updates queued -> running.
+    Optionally specify a custom SQLite database path.
     """
-    param_file = get_param_file_path(npub, since, curr_timestamp)
-    if os.path.exists(param_file):
-        os.remove(param_file)
+    conn = _get_db_connection(db_path)
+    # Try to find an existing job row for this key
+    cur = conn.execute(
+        """
+        SELECT j.id, j.status
+        FROM jobs j
+        JOIN npubs n ON n.id = j.npub_id
+        WHERE n.npub = ? AND j.since = ? AND j.till = ?
+        ORDER BY j.id DESC
+        LIMIT 1
+        """,
+        (npub, since, curr_timestamp),
+    )
+    row = cur.fetchone()
+
+    if row is None:
+        # No existing job; enqueue directly as running and set started_at
+        job_id = sqlite_store.enqueue_job(
+            conn, npub=npub, since=since, till=curr_timestamp, status="running"
+        )
+        sqlite_store.update_job_status(
+            conn, job_id=job_id, status="running", started_at=curr_timestamp
+        )
+        return
+
+    job_id = int(row[0])
+    status = str(row[1])
+    if status == "queued":
+        sqlite_store.update_job_status(
+            conn, job_id=job_id, status="running", started_at=curr_timestamp
+        )
+    # If already running, nothing to do
+
+def mark_command_completed(
+    npub: str, since: int, curr_timestamp: int, db_path: Optional[str] = None
+) -> None:
+    """
+    Mark any queued/running job for (npub, since, till=curr_timestamp) as success.
+    Optionally specify a custom SQLite database path.
+    """
+    conn = _get_db_connection(db_path)
+    cur = conn.execute(
+        """
+        SELECT j.id
+        FROM jobs j
+        JOIN npubs n ON n.id = j.npub_id
+        WHERE n.npub = ? AND j.since = ? AND j.till = ?
+          AND j.status IN ('queued','running')
+        """,
+        (npub, since, curr_timestamp),
+    )
+    rows = cur.fetchall() or []
+    for r in rows:
+        sqlite_store.update_job_status(
+            conn, job_id=int(r[0]), status="success", finished_at=curr_timestamp
+        )
+
+
+def mark_command_failed(
+    npub: str,
+    since: int,
+    curr_timestamp: int,
+    error_message: str,
+    db_path: Optional[str] = None,
+) -> None:
+    """
+    Mark any queued/running job for (npub, since, till=curr_timestamp) as failed.
+    Records the error message and finished_at timestamp.
+    Optionally specify a custom SQLite database path.
+    """
+    conn = _get_db_connection(db_path)
+    cur = conn.execute(
+        """
+        SELECT j.id
+        FROM jobs j
+        JOIN npubs n ON n.id = j.npub_id
+        WHERE n.npub = ? AND j.since = ? AND j.till = ?
+          AND j.status IN ('queued','running')
+        """,
+        (npub, since, curr_timestamp),
+    )
+    rows = cur.fetchall() or []
+    for r in rows:
+        sqlite_store.update_job_status(
+            conn,
+            job_id=int(r[0]),
+            status="failed",
+            error=error_message[:1000],
+            finished_at=curr_timestamp,
+        )

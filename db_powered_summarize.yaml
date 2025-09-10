@@ -12,7 +12,7 @@ instructions: |
   - Exploring Nostr events and timelines
 
   Here, your task is to:
-  - First, call the fetch_and_store function to fetch all the data for the {{ npub }}. If it's an npub, convert it into hex format. 
+  - First, call the fetch_and_store function to fetch all the data for the {{ npub }}. If it's an npub, convert it into hex format.
   - Then, call the summarize_and_add_relevancy_score function to summarize the events and add the relevancy score to the events.
   - Return the summary of what we did in the specified format. 
 
@@ -37,8 +37,8 @@ extensions:
   available_tools: []
 
 settings:
-  goose_provider: openai
-  goose_model: moonshotai/kimi-k2
+  goose_provider: openrouter
+  goose_model: anthropic/claude-sonnet-4
   temperature: 0.0
 
 activities:

@@ -875,27 +875,23 @@ async def summarize_and_add_relevancy_score(
 ) -> Dict[str, Any]:
     """Summarize events and add relevancy scores for a user's events in goose.db.
 
-    Wraps `fetch_and_store.summarize_and_add_relevancy_score` in a thread.
+    Runs inline without threading to avoid MCP transport issues.
     """
     try:
-        def _run() -> Dict[str, Any]:
-            from fetch_and_store import summarize_and_add_relevancy_score as _summarize
-            return _summarize(
-                instruction=instruction,
-                npub=npub,
-                since=since,
-                till=till,
-                max_concurrency=max_concurrency,
-                base_dir=base_dir,
-            )
-
-        result = await asyncio.to_thread(_run)
-        # Drop potentially large details payload from response
-        try:
-            if isinstance(result, dict) and 'details' in result:
-                result = {k: v for k, v in result.items() if k != 'details'}
-        except Exception:
-            pass
+        # Import the function directly and run it in the current context
+        # This avoids any threading issues with the MCP transport layer
+        from fetch_and_store import summarize_and_add_relevancy_score as _summarize
+        
+        # Run the async function directly
+        result = await _summarize(
+            instruction=instruction,
+            npub=npub,
+            since=since,
+            till=till,
+            max_concurrency=max_concurrency,
+            base_dir=base_dir,
+        )
+        
         return result
     except Exception as e:
         logger.error(f"Error in summarize_and_add_relevancy_score tool: {str(e)}")

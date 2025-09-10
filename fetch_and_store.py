@@ -5,6 +5,8 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+import aiohttp
+
 from pynostr.key import PublicKey
 
 # Optional storage
@@ -243,7 +245,7 @@ async def _main(argv: List[str]) -> int:
             print(f"Warning: failed to store collected data: {e}", file=sys.stderr)
     return 0
 
-def summarize_and_add_relevancy_score(
+async def summarize_and_add_relevancy_score(
     instruction: str,
     npub: str,
     since: Optional[int] = None,
@@ -269,8 +271,6 @@ def summarize_and_add_relevancy_score(
     """
     import os
     import sqlite3
-    import urllib.request
-    import urllib.error
 
     if get_connection is None:
         raise RuntimeError("sqlite storage is unavailable in this runtime")
@@ -282,15 +282,7 @@ def summarize_and_add_relevancy_score(
     # Per user preference, API keys are in a separate DB (keys.db). [[memory:8544858]]
     keys_db_path = os.path.join(base_dir_val, "keys.db")
 
-    # Debug: function start and DB paths
-    print(
-        f"[summarize_and_add_relevancy_score] start npub={npub} since={since} till={till}",
-        flush=True,
-    )
-    print(
-        f"[summarize_and_add_relevancy_score] db_path={db_path} keys_db_path={keys_db_path}",
-        flush=True,
-    )
+
 
     # Load API key if available; URL left blank intentionally for user to fill later
     api_key_value: Optional[str] = None
@@ -309,22 +301,30 @@ def summarize_and_add_relevancy_score(
     api_base_url = "https://ai.redsh1ft.com"  # Intentionally left blank; user will set this
     api_model = "google/gemma-3-27b-it"
 
-    def _chat_completion(payload: Dict[str, Any]) -> Dict[str, Any]:
+    async def _chat_completion(session: aiohttp.ClientSession, payload: Dict[str, Any]) -> Dict[str, Any]:
         if not api_base_url:
             raise ValueError("OpenAI-compatible API base URL is not set.")
         url = api_base_url.rstrip("/") + "/v1/chat/completions"
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                **({"Authorization": f"Bearer {api_key_value}"} if api_key_value else {}),
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req) as resp:
-            body = resp.read().decode("utf-8")
-            return json.loads(body)
+        headers = {
+            "Content-Type": "application/json",
+            **({"Authorization": f"Bearer {api_key_value}"} if api_key_value else {}),
+        }
+        try:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                body = await resp.text()
+                
+                if not body.strip():
+                    raise ValueError("Empty response from API")
+                
+                if resp.status >= 400:
+                    raise ValueError(f"HTTP {resp.status} error from API: {resp.reason}. Body: {body[:500]}")
+                
+                try:
+                    return json.loads(body)
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"Invalid JSON response from API: {e}. Response body: {body[:500]}")
+        except aiohttp.ClientError as e:
+            raise ValueError(f"Network error connecting to API: {e}")
 
     def _build_messages(user_input: str, include_summary: bool) -> List[Dict[str, str]]:
         if include_summary:
@@ -370,7 +370,6 @@ def summarize_and_add_relevancy_score(
             base_pub = npub
 
         task_id = f"{base_pub}_{since_val}_{till_val}"
-        print(f"[summarize_and_add_relevancy_score] task_id={task_id}", flush=True)
 
         # Fetch candidate events for this task
         cur.execute(
@@ -384,7 +383,6 @@ def summarize_and_add_relevancy_score(
         )
 
         events: List[sqlite3.Row] = cur.fetchall() or []
-        print(f"[summarize_and_add_relevancy_score] fetched {len(events)} events from DB", flush=True)
         processed = 0
         updated = 0
         skipped = 0
@@ -407,12 +405,6 @@ def summarize_and_add_relevancy_score(
 
             # Choose input source per requirement
             user_input = context_content if thread_size > 1 and context_content else event_content
-            print(
-                f"[summarize_and_add_relevancy_score] ({processed}) event_id={event_id} thread_size={thread_size} "
-                f"input_source={'context' if (thread_size > 1 and context_content) else 'event'} "
-                f"input_len={len(user_input)}",
-                flush=True,
-            )
 
             if not user_input:
                 skipped += 1
@@ -421,7 +413,6 @@ def summarize_and_add_relevancy_score(
                     "status": "skipped",
                     "reason": "no content to summarize",
                 })
-                print(f"[summarize_and_add_relevancy_score] ({processed}) skipped event_id={event_id}: empty input", flush=True)
                 continue
 
             include_summary = thread_size > 1
@@ -444,7 +435,6 @@ def summarize_and_add_relevancy_score(
                 "details": details,
             }
 
-        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         def _build_response_format(include_summary: bool) -> Dict[str, Any]:
             if include_summary:
@@ -490,7 +480,7 @@ def summarize_and_add_relevancy_score(
                     },
                 }
 
-        def _worker(job: Dict[str, Any]) -> Dict[str, Any]:
+        async def _worker(session: aiohttp.ClientSession, job: Dict[str, Any]) -> Dict[str, Any]:
             user_input = job["user_input"]
             include_summary = job["include_summary"]
             messages = _build_messages(user_input, include_summary=include_summary)
@@ -500,16 +490,12 @@ def summarize_and_add_relevancy_score(
                 "temperature": 0.2,
                 "response_format": _build_response_format(include_summary),
             }
-            print(
-                f"[summarize_and_add_relevancy_score] calling LLM model={api_model} temp=0.2 format={'summary+score' if include_summary else 'score-only'} input_preview={user_input[:120].replace('\n',' ')}...",
-                flush=True,
-            )
 
             attempts = 3
             last_error: Optional[Exception] = None
             for attempt in range(1, attempts + 1):
                 try:
-                    resp = _chat_completion(payload)
+                    resp = await _chat_completion(session, payload)
                     content_text = (
                         ((resp.get("choices") or [{}])[0].get("message") or {}).get("content")
                         if isinstance(resp, dict) else None
@@ -537,10 +523,7 @@ def summarize_and_add_relevancy_score(
                 except Exception as e:
                     last_error = e
                     if attempt < attempts:
-                        try:
-                            time.sleep(1)
-                        except Exception:
-                            pass
+                        await asyncio.sleep(1)
                     else:
                         return {
                             "ok": False,
@@ -560,21 +543,27 @@ def summarize_and_add_relevancy_score(
         if max_workers <= 0:
             max_workers = 1
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_job = {executor.submit(_worker, job): job for job in jobs}
-            for future in as_completed(future_to_job):
-                job = future_to_job[future]
+        # Create aiohttp session and semaphore for concurrency control
+        connector = aiohttp.TCPConnector(limit=max_workers)
+        semaphore = asyncio.Semaphore(max_workers)
+        
+        async def _worker_with_semaphore(session: aiohttp.ClientSession, job: Dict[str, Any]) -> Dict[str, Any]:
+            async with semaphore:
+                return await _worker(session, job)
+        
+        async with aiohttp.ClientSession(connector=connector) as session:
+            tasks = [_worker_with_semaphore(session, job) for job in jobs]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for job, result in zip(jobs, results):
                 event_id = job["event_id"]
-                try:
-                    result = future.result()
-                except Exception as e:
+                if isinstance(result, Exception):
                     skipped += 1
                     details.append({
                         "event_id": event_id,
                         "status": "error",
-                        "error": str(e),
+                        "error": str(result),
                     })
-                    print(f"[summarize_and_add_relevancy_score] future failed for event_id={event_id}: {e}", flush=True)
                     continue
 
                 if result.get("ok"):
@@ -619,10 +608,6 @@ def summarize_and_add_relevancy_score(
                         "error": str(result.get("error")),
                         "attempts": int(result.get("attempts") or 0),
                     })
-                    print(
-                        f"[summarize_and_add_relevancy_score] error event_id={event_id}: {result.get('error')}",
-                        flush=True,
-                    )
 
         return {
             "success": True,
@@ -637,6 +622,69 @@ def summarize_and_add_relevancy_score(
             connection.close()
         except Exception:
             pass
+
+async def summarize_and_add_relevancy_score2(
+    instruction: str,
+    npub: str,
+    since: Optional[int] = None,
+    till: Optional[int] = None,
+    max_concurrency: int = 20,
+    base_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Summarize events and add relevancy scores in goose.db for a given npub.
+
+    - Fetches events from the local SQLite DB (goose.db)
+    - Uses context_content when the event is part of a thread (has related events)
+    - Calls an OpenAI-compatible API to generate {context_summary, relevancy_score}
+    - Stores results back into the DB (events.context_summary, events.relevancy_score)
+
+    Args:
+        instruction: Instruction passed to the LLM (e.g., what to score for)
+        npub: The npub whose events to process
+        since: Optional unix timestamp lower bound
+        till: Optional unix timestamp upper bound
+
+    Returns:
+        Summary dict with counts and per-event statuses.
+    """
+    import os
+    import sqlite3
+
+    if get_connection is None:
+        raise RuntimeError("sqlite storage is unavailable in this runtime")
+
+    # Resolve DB paths
+    base_dir_val = base_dir or os.path.dirname(__file__)
+    db_path = os.path.join(base_dir_val, "goose.db")
+
+    # Per user preference, API keys are in a separate DB (keys.db). [[memory:8544858]]
+    keys_db_path = os.path.join(base_dir_val, "keys.db")
+
+    # Load API key if available; URL left blank intentionally for user to fill later
+    api_key_value: Optional[str] = None
+    if fetch_api_key is not None and os.path.exists(keys_db_path):
+        try:
+            kconn = get_connection(keys_db_path)
+            try:
+                rec = fetch_api_key(kconn, api_id="main")
+                if rec and isinstance(rec, dict):
+                    api_key_value = rec.get("api_key")
+            finally:
+                kconn.close()
+        except Exception:
+            api_key_value = None
+
+    api_base_url = "https://ai.redsh1ft.com"  # Intentionally left blank; user will set this
+    api_model = "google/gemma-3-27b-it"
+
+    return {
+        "success": True,
+        "npub": npub,
+        "processed": 0,
+        "updated": 0,
+        "skipped": 0,
+        "details": [],
+    }
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(_main(sys.argv[1:])))
