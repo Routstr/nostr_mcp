@@ -317,6 +317,7 @@ def load_formatted_npub_output(
            e.context_summary   AS context_summary,
            e.timestamp         AS timestamp,
            e.relevancy_score   AS relevancy_score,
+           e.reason_for_score  AS reason_for_score,
            n.npub              AS npub,
            n.name              AS name,
            n.profile_pic       AS profile_pic
@@ -362,6 +363,7 @@ def load_formatted_npub_output(
            "context_summary": row["context_summary"] or "",
            "timestamp": int(row["timestamp"]) if row["timestamp"] is not None else 0,
            "relevancy_score": float(row["relevancy_score"]) if row["relevancy_score"] is not None else 0.0,
+           "reason_for_score": row["reason_for_score"] or "",
            "events_in_thread": related_ids,
        })
 

@@ -64,6 +64,7 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             context_summary     TEXT,
             timestamp           INTEGER, -- unix timestamp of the event
             relevancy_score     REAL,
+            reason_for_score    TEXT,
             task_id             TEXT, -- batch identifier: pubkey_since_till
             created_at          INTEGER DEFAULT (strftime('%s','now')),
             updated_at          INTEGER DEFAULT (strftime('%s','now')),
@@ -241,6 +242,7 @@ def upsert_event(
     context_summary: Optional[str] = None,
     timestamp: Optional[int] = None,
     relevancy_score: Optional[float] = None,
+    reason_for_score: Optional[str] = None,
     task_id: Optional[str] = None,
 ) -> int:
     """Insert or update an event row by its external event_id, return row id.
@@ -256,8 +258,8 @@ def upsert_event(
             """
             INSERT INTO events (
                 npub_id, event_id, event_content, context_content, context_summary,
-                timestamp, relevancy_score, task_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                timestamp, relevancy_score, reason_for_score, task_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 npub_id,
@@ -267,6 +269,7 @@ def upsert_event(
                 context_summary,
                 timestamp,
                 relevancy_score,
+                reason_for_score,
                 task_id,
             ),
         )
@@ -293,7 +296,9 @@ def upsert_event(
     if relevancy_score is not None:
         updates.append("relevancy_score = ?")
         params.append(relevancy_score)
-
+    if reason_for_score is not None:
+        updates.append("reason_for_score = ?")
+        params.append(reason_for_score)
     if updates:
         set_clause = ", ".join(updates)
         params.append(event_row_id)
@@ -364,6 +369,7 @@ def store_npub_record_with_events(
             context_summary=event.get("context_summary"),
             timestamp=event.get("timestamp"),
             relevancy_score=event.get("relevancy_score"),
+            reason_for_score=event.get("reason_for_score"),
             task_id=task_id,
         )
         event_id_to_row_id[str(event.get("event_id"))] = row_id

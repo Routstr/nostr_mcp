@@ -342,18 +342,18 @@ async def summarize_and_add_relevancy_score(
     def _build_messages(user_input: str, include_summary: bool) -> List[Dict[str, str]]:
         if include_summary:
             system_prompt = (
-                "This is the content of a Nostr event or its thread context:"+user_input+"\n"
+                "This is the content of a Nostr event or its thread context you're supposed to score:"+user_input+"\n"
                 "Return a strict JSON object with keys: \n"
                 "- context_summary: short summary of the content/thread (<= 280 chars).\n"
-                "- relevancy_score: score of 0-100 indicating relevance to the instruction:"+instruction+"\n"
+                "- relevancy_score: score of 0-100 indicating relevance to the instruction:"+instruction+". 100 if the content is exactly what the instruction is asking for, 0 if the content is not relevant to the instruction. if the content is relevant but not exactly what the instruction is asking for, give a score between 0 and 100 based on how relevant it is to the instruction. \n"
                 "- reason_for_score: reason for the score given based on the instruction \n"
                 "No additional text."
             )
         else:
             system_prompt = (
-                "This is the content of a single Nostr event (no thread context):"+user_input+"\n"
+                "This is the content of a single Nostr event you're supposed to score (no thread context):"+user_input+"\n"
                 "Return a strict JSON object with two keys: relevancy_score and reason_for_score \n"
-                "- relevancy_score: score of 0-100 indicating relevance to the instruction: "+instruction+" \n"
+                "- relevancy_score: score of 0-100 indicating relevance to the instruction: "+instruction+". 100 if the content is exactly what the instruction is asking for, 0 if the content is not relevant to the instruction. if the content is relevant but not exactly what the instruction is asking for, give a score between 0 and 100 based on how relevant it is to the instruction. \n"
                 "- reason_for_score: reason for the score given based on the instruction \n"
                 "No additional text."
             )
@@ -477,8 +477,12 @@ async def summarize_and_add_relevancy_score(
                                     "type": "number",
                                     "description": "Score 0-100 for relevance to the instruction",
                                 },
+                                "reason_for_score": {
+                                    "type": "string",
+                                    "description": "Reason for the score given based on the instruction",
+                                },
                             },
-                            "required": ["context_summary", "relevancy_score"],
+                            "required": ["context_summary", "relevancy_score", "reason_for_score"],
                             "additionalProperties": False,
                         },
                     },
@@ -495,9 +499,13 @@ async def summarize_and_add_relevancy_score(
                                 "relevancy_score": {
                                     "type": "number",
                                     "description": "Score 0-100 for relevance to the instruction",
-                                }
+                                },
+                                "reason_for_score": {
+                                    "type": "string",
+                                    "description": "Reason for the score given based on the instruction",
+                                },
                             },
-                            "required": ["relevancy_score"],
+                            "required": ["relevancy_score", "reason_for_score"],
                             "additionalProperties": False,
                         },
                     },
@@ -529,6 +537,7 @@ async def summarize_and_add_relevancy_score(
                     result_obj = json.loads(content_text)
                     context_summary_val = str(result_obj.get("context_summary", "")).strip()
                     relevancy_score_val = result_obj.get("relevancy_score", None)
+                    reason_for_score_val = result_obj.get("reason_for_score", None)
                     try:
                         relevancy_score_num = float(relevancy_score_val) if relevancy_score_val is not None else None
                     except Exception:
@@ -542,6 +551,7 @@ async def summarize_and_add_relevancy_score(
                         "thread_size": job["thread_size"],
                         "context_summary": context_summary_val,
                         "relevancy_score": relevancy_score_num,
+                        "reason_for_score": reason_for_score_val,
                     }
                 except Exception as e:
                     last_error = e
@@ -554,6 +564,7 @@ async def summarize_and_add_relevancy_score(
                             "npub_id": job["npub_id"],
                             "event_id": job["event_id"],
                             "thread_size": job["thread_size"],
+                            "reason_for_score": reason_for_score_val,
                             "error": str(last_error),
                             "attempts": attempts,
                         }
@@ -564,6 +575,7 @@ async def summarize_and_add_relevancy_score(
                 "npub_id": job.get("npub_id"),
                 "event_id": job.get("event_id"),
                 "thread_size": job.get("thread_size", 1),
+                "reason_for_score": reason_for_score_val,
                 "error": "Unknown failure",
                 "attempts": 0,
             }
@@ -604,6 +616,7 @@ async def summarize_and_add_relevancy_score(
                     relevancy_score_num = result.get("relevancy_score")
                     event_row_id = int(result["event_row_id"])  # for fallback update
                     npub_id_val = int(result["npub_id"])  # for upsert_event path
+                    reason_for_score_val = str(result.get("reason_for_score") or "").strip()
                     if upsert_event is None:
                         update_fields = []
                         update_params: List[Any] = []
@@ -613,6 +626,9 @@ async def summarize_and_add_relevancy_score(
                         if relevancy_score_num is not None:
                             update_fields.append("relevancy_score = ?")
                             update_params.append(relevancy_score_num)
+                        if reason_for_score_val:
+                            update_fields.append("reason_for_score = ?")
+                            update_params.append(reason_for_score_val)
                         if update_fields:
                             update_sql = ", ".join(update_fields)
                             cur.execute(f"UPDATE events SET {update_sql} WHERE id = ?", update_params + [event_row_id])
@@ -625,6 +641,7 @@ async def summarize_and_add_relevancy_score(
                             event_id=event_id,
                             context_summary=context_summary_val or None,
                             relevancy_score=relevancy_score_num,
+                            reason_for_score=reason_for_score_val,
                         )
                         updated += 1
 
@@ -632,6 +649,7 @@ async def summarize_and_add_relevancy_score(
                         "event_id": event_id,
                         "status": "updated",
                         "thread_size": int(result.get("thread_size") or 1),
+                        "reason_for_score": reason_for_score_val,
                     })
                 else:
                     skipped += 1
@@ -640,6 +658,7 @@ async def summarize_and_add_relevancy_score(
                         "status": "error",
                         "error": str(result.get("error")),
                         "attempts": int(result.get("attempts") or 0),
+                        "reason_for_score": result.get("reason_for_score", None),
                     })
 
         result_payload = {
