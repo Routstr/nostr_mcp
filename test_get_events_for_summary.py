@@ -5,13 +5,13 @@ import asyncio
 import json
 import time
 from datetime import datetime, timedelta
-from nostr_mcp import get_events_for_summary
+from nostr_mcp import get_events_for_summary, fetch_and_store
 
 async def test_get_events_for_summary():
     """Test the get_events_for_summary function."""
     
     # Example npub (you can replace with a real one for testing)
-    test_npub = "npub1dergggklka99wwrs92yz8wdjs952h2ux2ha2ed598ngwu9w7a6fsh9xzpc"  # Example npub
+    test_npub = "npub1ftt05tgku25m2akgvw6v7aqy5ux5mseqcrzy05g26ml43xf74nyqsredsh"  # Example npub
     
     # Get events from the last 24 hours
     since_timestamp = int(time.time()) - (24 * 60 * 60)  # 24 hours ago
@@ -23,10 +23,13 @@ async def test_get_events_for_summary():
     
     try:
         # Call the function
-        result = await get_events_for_summary(
-            pubkey=test_npub,
-            since=since_timestamp
+        result = await fetch_and_store(
+            npub_or_hex=test_npub,
+            since=since_timestamp,
+            till=int(time.time()),
+            base_dir="/Users/r/projects/routstr_main/nostr_mcp"
         )
+        print(result)
         
         if result['success']:
             print(f"✅ Successfully fetched events")

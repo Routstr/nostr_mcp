@@ -3,6 +3,7 @@ import json
 import asyncio
 from typing import Optional, List, Dict, Any
 import logging
+import aiohttp
 
 logger = logging.getLogger("nostr-mcp")
 
@@ -15,30 +16,59 @@ except ImportError:
     logger.warning("pynostr not available, npub/hex conversion will be disabled")
 
 def parse_e_tags(event_tags: List[List[str]]) -> Dict[str, List[str]]:
-    """Parse e tags from an event to extract root and reply references.
+    """Parse 'e' and 'q' tags from an event.
+
+    - 'e' tags: extract root/reply references and their relays when present
+    - 'q' tags: extract quoted event references and their relays
     
     Args:
         event_tags: List of tag arrays from a nostr event
         
     Returns:
-        Dict with 'root' and 'reply' lists containing event IDs
+        Dict with:
+          - 'root': list of event IDs marked as root
+          - 'reply': list of event IDs marked as reply or unmarked 'e' references
+          - 'quote': list of quoted event IDs from 'q' tags
+          - 'root_relays' | 'reply_relays' | 'quote_relays': lists of relay URLs
     """
-    e_tags = {'root': [], 'reply': []}
-    
+    e_tags: Dict[str, List[str]] = {'root': [], 'reply': []}
+
     for tag in event_tags:
-        if len(tag) >= 2 and tag[0] == 'e':
+        if not isinstance(tag, list) or len(tag) < 2:
+            continue
+
+        kind = tag[0]
+
+        if kind == 'e':
             event_id = tag[1]
             # Check if there's a marker (root/reply) in the tag
             if len(tag) >= 4:
                 marker = tag[3]
+                relay_url = tag[2]
                 if marker == 'root':
                     e_tags['root'].append(event_id)
+                    if relay_url:
+                        e_tags.setdefault('root_relays', []).append(relay_url)
                 elif marker == 'reply':
+                    e_tags['reply'].append(event_id)
+                    if relay_url:
+                        e_tags.setdefault('reply_relays', []).append(relay_url)
+                else:
+                    # Unknown marker; treat as general reference
                     e_tags['reply'].append(event_id)
             else:
                 # If no marker, treat as general reference
                 e_tags['reply'].append(event_id)
-    
+
+        elif kind == 'q':
+            # NIP-XXX: quote reference tag. Format typically: ['q', event_id, relay?, ...]
+            quote_event_id = tag[1]
+            e_tags.setdefault('quote', []).append(quote_event_id)
+            if len(tag) >= 3:
+                relay_url = tag[2]
+                if relay_url:
+                    e_tags.setdefault('quote_relays', []).append(relay_url)
+
     return e_tags
 
 
@@ -81,7 +111,9 @@ async def fetch_event_context(
     event_id: str,
     fetch_events_func,
     relays: Optional[List[str]] = None,
-    max_depth: int = 50
+    max_depth: int = 50,
+    initial_event: Optional[Dict[str, Any]] = None,
+    root_event: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Fetch the full context of a Nostr event by following the reply chain to the root.
     
@@ -90,28 +122,31 @@ async def fetch_event_context(
         fetch_events_func: Function to fetch events (should be fetch_nostr_events)
         relays: Optional list of relays to use
         max_depth: Maximum depth to prevent infinite loops
+        initial_event: If provided, use this event as the starting point instead of refetching
         
     Returns:
         Dict containing the event context, thread events, and summary
     """
     try:
-        # Fetch the initial event
-        result = await fetch_events_func(ids=[event_id], limit=1, relays=relays)
-        parsed_result = json.loads(result)
+        # Fetch or use the initial event
+        if initial_event and isinstance(initial_event, dict):
+            current_event = initial_event
+        else:
+            result = await fetch_events_func(ids=[event_id], limit=1, relays=relays)
+            parsed_result = json.loads(result)
+            
+            if not parsed_result['success'] or not parsed_result['events']:
+                return {
+                    'success': False,
+                    'error': f'Event {event_id} not found',
+                    'nevent': event_id,
+                    'context': '',
+                    'no_of_events': 0,
+                    'events': []
+                }
+            current_event = parsed_result['events'][0]
         
-        if not parsed_result['success'] or not parsed_result['events']:
-            return {
-                'success': False,
-                'error': f'Event {event_id} not found',
-                'nevent': event_id,
-                'context': '',
-                'no_of_events': 0,
-                'events': []
-            }
-        
-        initial_event = parsed_result['events'][0]
-        thread_events = [initial_event]
-        current_event = initial_event
+        thread_events = [current_event]
         depth = 0
         
         # Follow the reply chain backwards to the root
@@ -136,14 +171,16 @@ async def fetch_event_context(
                     # Check if this event only has root tags (we've reached the conversation start)
                     reply_e_tags = parse_e_tags(reply_event['tags'])
                     if not reply_e_tags['reply'] and reply_e_tags['root']:
-                        # This event only replies to root, fetch the root event
+                        # This event only replies to root, use provided root_event if available, else fetch
                         root_id = reply_e_tags['root'][0]
-                        root_result = await fetch_events_func(ids=[root_id], limit=1, relays=relays)
-                        root_parsed = json.loads(root_result)
-                        
-                        if root_parsed['success'] and root_parsed['events']:
-                            root_event = root_parsed['events'][0]
+                        if root_event and isinstance(root_event, dict) and root_event.get('id') == root_id:
                             thread_events.append(root_event)
+                        else:
+                            root_result = await fetch_events_func(ids=[root_id], limit=1, relays=relays)
+                            root_parsed = json.loads(root_result)
+                            if root_parsed['success'] and root_parsed['events']:
+                                fetched_root = root_parsed['events'][0]
+                                thread_events.append(fetched_root)
                         break
                     elif not reply_e_tags['reply'] and not reply_e_tags['root']:
                         # This is the root event itself
@@ -153,14 +190,16 @@ async def fetch_event_context(
                     break
             
             elif e_tags['root']:
-                # Only root tag, fetch the root event
+                # Only root tag, append provided root_event if available, otherwise fetch it
                 root_id = e_tags['root'][0]
-                root_result = await fetch_events_func(ids=[root_id], limit=1, relays=relays)
-                root_parsed = json.loads(root_result)
-                
-                if root_parsed['success'] and root_parsed['events']:
-                    root_event = root_parsed['events'][0]
+                if root_event and isinstance(root_event, dict) and root_event.get('id') == root_id:
                     thread_events.append(root_event)
+                else:
+                    root_result = await fetch_events_func(ids=[root_id], limit=1, relays=relays)
+                    root_parsed = json.loads(root_result)
+                    if root_parsed['success'] and root_parsed['events']:
+                        fetched_root = root_parsed['events'][0]
+                        thread_events.append(fetched_root)
                 break
             else:
                 # No e tags, this is likely the root event itself
@@ -251,6 +290,188 @@ def summarize_thread_context(context_result: Dict[str, Any]) -> str:
     
     return "\n".join(summary_lines)
 
+
+async def process_events_for_npub(
+    *,
+    authors: List[str],
+    since: int,
+    used_relays: Optional[List[str]],
+    events_by_pubkey: Dict[str, List[Dict[str, Any]]],
+    fetch_events_func,
+) -> List[Dict[str, Any]]:
+    """Build per-author layers with formatted events and thread context.
+
+    Mirrors the per-author logic used by get_events_for_summary_multi.
+
+    Args:
+        authors: Input authors in npub or hex format
+        since: Unix timestamp used for response metadata
+        used_relays: Relays to use for context fetching
+        events_by_pubkey: Mapping of hex pubkey -> list of kind 1 events
+        fetch_events_func: Callable compatible with fetch_nostr_events for context fetching
+
+    Returns:
+        List of layer dicts for each input author
+    """
+    # Normalize inputs
+    normalized_inputs: List[Dict[str, Any]] = []
+    for author in authors:
+        entry: Dict[str, Any] = {'author_input': author}
+        try:
+            if isinstance(author, str) and author.startswith('npub'):
+                if not PYNOSTR_AVAILABLE:
+                    raise ValueError('pynostr not available for npub conversion')
+                pk = PublicKey.from_npub(author)
+                entry['pubkey'] = pk.hex()
+            else:
+                entry['pubkey'] = author
+        except Exception as e:
+            entry['error'] = f'Invalid author pubkey: {str(e)}'
+        normalized_inputs.append(entry)
+
+    layers: List[Dict[str, Any]] = []
+
+    # Prefetch root events across all authors to avoid sequential fetches
+    prefetched_roots: Dict[str, Dict[str, Any]] = {}
+    try:
+        root_ids_set: set[str] = set()
+        root_relays_set: set[str] = set()
+        for author_events in (events_by_pubkey or {}).values():
+            for ev in author_events or []:
+                try:
+                    e_tags_all = parse_e_tags(ev.get('tags', []))
+                    if e_tags_all.get('root'):
+                        root_ids_set.add(e_tags_all['root'][0])
+                        for rr in (e_tags_all.get('root_relays') or []):
+                            try:
+                                if rr:
+                                    root_relays_set.add(rr)
+                            except Exception:
+                                continue
+                except Exception:
+                    continue
+        if root_ids_set:
+            try:
+                # Use a union list of root relays if present; otherwise fall back to used_relays
+                effective_relays = list(root_relays_set) if root_relays_set else used_relays
+                raw = await fetch_events_func(ids=list(root_ids_set), relays=effective_relays, limit=None)
+                parsed = json.loads(raw)
+                if parsed.get('success') and isinstance(parsed.get('events'), list):
+                    for rev in parsed.get('events') or []:
+                        rid = rev.get('id')
+                        if rid:
+                            prefetched_roots[rid] = rev
+            except Exception:
+                # Best-effort prefetch; proceed without if it fails
+                pass
+    except Exception:
+        pass
+
+    # Build per-author formatted events
+    for ni in normalized_inputs:
+        original = ni.get('author_input')
+        hex_author = ni.get('pubkey')
+        prior_err = ni.get('error')
+
+        if prior_err or not hex_author:
+            layers.append({
+                'success': False,
+                'author_input': original,
+                'since_timestamp': since,
+                'error': prior_err or 'Invalid author pubkey',
+                'events': [],
+                'total_events': 0
+            })
+            continue
+
+        author_events = events_by_pubkey.get(hex_author, [])
+
+        formatted_events: List[Dict[str, Any]] = []
+        processed_threads = set()
+
+        for event in author_events:
+            try:
+                event_id = event['id']
+                e_tags = parse_e_tags(event['tags'])
+
+                if e_tags['root'] or e_tags['reply']:
+                    thread_root = e_tags['root'][0] if e_tags['root'] else None
+                    if thread_root and thread_root in processed_threads:
+                        continue
+
+                    context_result = await fetch_event_context(
+                        event_id=event_id,
+                        fetch_events_func=fetch_events_func,
+                        relays=used_relays,
+                        initial_event=event,
+                        root_event=prefetched_roots.get(thread_root) if thread_root else None
+                    )
+
+                    if context_result.get('success') and context_result.get('thread_events'):
+                        if thread_root:
+                            processed_threads.add(thread_root)
+
+                        thread_events = context_result['thread_events']
+                        root_event = thread_events[0] if thread_events else None
+
+                        original_event = None
+                        for te in thread_events:
+                            if te['id'] == event_id:
+                                original_event = te
+                                break
+
+                        context_parts: List[str] = []
+                        if root_event:
+                            context_parts.append(f"Root event that started the thread: {root_event['content']}")
+
+                        reply_events = [te for te in thread_events if te['id'] != event_id and (not root_event or te['id'] != root_event['id'])]
+                        if reply_events:
+                            context_parts.append("Reply events:")
+                            for reply in reply_events:
+                                context_parts.append(reply['content'])
+
+                        if original_event:
+                            context_parts.append(f"Original Event: {original_event['content']}")
+
+                        context_content = "\n".join(context_parts)
+
+                        formatted_event = {
+                            'event_id': event_id,
+                            'event_content': event['content'],
+                            'timestamp': event['created_at'],
+                            'context_content': context_content,
+                            'events_in_thread': [te['id'] for te in thread_events],
+                            'pubkey': event['pubkey'],
+                            'kind': event['kind']
+                        }
+                        formatted_events.append(formatted_event)
+                else:
+                    formatted_event = {
+                        'event_id': event_id,
+                        'event_content': event['content'],
+                        'timestamp': event['created_at'],
+                        'context_content': "Standalone event (not part of a thread)",
+                        'events_in_thread': [event_id],
+                        'pubkey': event['pubkey'],
+                        'kind': event['kind']
+                    }
+                    formatted_events.append(formatted_event)
+            except Exception:
+                # Skip problematic events for robustness
+                continue
+
+        layers.append({
+            'success': True,
+            'author_input': original,
+            'pubkey': hex_author,
+            'since_timestamp': since,
+            'name': '',
+            'profile_pic': '',
+            'total_events': len(formatted_events),
+            'events': formatted_events
+        })
+
+    return layers
 
 import os
 from glob import glob
@@ -367,9 +588,14 @@ def load_formatted_npub_output(
            "events_in_thread": related_ids,
        })
 
+   result = get_api_base_url_and_model(npub, since, curr_timestamp, db_path)
+   if result is not None:
+       api_base_url, api_model = result
+   else:
+       api_base_url, api_model = None, None
    # Preserve deterministic order by npub key
    output = [grouped[k] for k in sorted(grouped.keys())]
-   return {"output": output}
+   return {"output": output, "api_base_url": api_base_url, "api_model": api_model}
 
 def get_param_file_path(npub: str, since: int, curr_timestamp: int) -> str:
     """
@@ -415,8 +641,47 @@ def get_job_status(
     except Exception:
         return None
 
-def mark_command_running(
+def get_api_base_url_and_model(
     npub: str, since: int, curr_timestamp: int, db_path: Optional[str] = None
+) -> Optional[Dict[str, Optional[str]]]:
+    """
+    Return the most recent API configuration (api_base_url, api_model) for
+    (npub, since, till=curr_timestamp), or None if no job exists.
+
+    Args:
+        npub: npub identifier
+        since: window start
+        curr_timestamp: window end used as till
+        db_path: optional custom SQLite DB path
+
+    Returns:
+        Dict with keys 'api_base_url' and 'api_model', or None if missing.
+    """
+    try:
+        conn = _get_db_connection(db_path)
+        cur = conn.execute(
+            """
+            SELECT j.api_base_url, j.api_model
+            FROM jobs j
+            JOIN npubs n ON n.id = j.npub_id
+            WHERE n.npub = ? AND j.since = ? AND j.till = ?
+            ORDER BY j.id DESC
+            LIMIT 1
+            """,
+            (npub, since, curr_timestamp),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "api_base_url": str(row[0]) if row[0] is not None else None,
+            "api_model": str(row[1]) if row[1] is not None else None,
+        }
+    except Exception:
+        return None
+
+def mark_command_running(
+    npub: str, since: int, curr_timestamp: int, db_path: Optional[str] = None, api_base_url: Optional[str] = None, api_model: Optional[str] = None
 ) -> None:
     """
     Mark a job as running in the database for (npub, since, till=curr_timestamp).
@@ -441,10 +706,10 @@ def mark_command_running(
     if row is None:
         # No existing job; enqueue directly as running and set started_at
         job_id = sqlite_store.enqueue_job(
-            conn, npub=npub, since=since, till=curr_timestamp, status="running"
+            conn, npub=npub, since=since, till=curr_timestamp, status="running", api_base_url=api_base_url, api_model=api_model
         )
         sqlite_store.update_job_status(
-            conn, job_id=job_id, status="running", started_at=curr_timestamp
+            conn, job_id=job_id, status="running", started_at=curr_timestamp, api_base_url=api_base_url, api_model=api_model
         )
         return
 
@@ -452,12 +717,12 @@ def mark_command_running(
     status = str(row[1])
     if status == "queued":
         sqlite_store.update_job_status(
-            conn, job_id=job_id, status="running", started_at=curr_timestamp
+            conn, job_id=job_id, status="running", started_at=curr_timestamp, api_base_url=api_base_url, api_model=api_model
         )
     # If already running, nothing to do
 
 def mark_command_completed(
-    npub: str, since: int, curr_timestamp: int, db_path: Optional[str] = None
+    npub: str, since: int, curr_timestamp: int, db_path: Optional[str] = None, api_base_url: Optional[str] = None, api_model: Optional[str] = None
 ) -> None:
     """
     Mark any queued/running job for (npub, since, till=curr_timestamp) as success.
@@ -477,7 +742,7 @@ def mark_command_completed(
     rows = cur.fetchall() or []
     for r in rows:
         sqlite_store.update_job_status(
-            conn, job_id=int(r[0]), status="success", finished_at=curr_timestamp
+            conn, job_id=int(r[0]), status="success", finished_at=curr_timestamp, api_base_url=api_base_url, api_model=api_model
         )
 
 
@@ -487,6 +752,8 @@ def mark_command_failed(
     curr_timestamp: int,
     error_message: str,
     db_path: Optional[str] = None,
+    api_base_url: Optional[str] = None,
+    api_model: Optional[str] = None,
 ) -> None:
     """
     Mark any queued/running job for (npub, since, till=curr_timestamp) as failed.
@@ -512,4 +779,7 @@ def mark_command_failed(
             status="failed",
             error=error_message[:1000],
             finished_at=curr_timestamp,
+            api_base_url=api_base_url,
+            api_model=api_model,
         )
+

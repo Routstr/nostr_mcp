@@ -93,6 +93,8 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             since           INTEGER NOT NULL,
             till            INTEGER NOT NULL,
             status          TEXT NOT NULL,
+            api_base_url    TEXT,
+            api_model       TEXT,
             last_error      TEXT,
             created_at      INTEGER DEFAULT (strftime('%s','now')),
             updated_at      INTEGER DEFAULT (strftime('%s','now')),
@@ -193,7 +195,7 @@ def upsert_npub(
         )
         npub_id = cursor.lastrowid
         connection.commit()
-        return npub_id
+        return int(npub_id) if npub_id is not None else 0
 
     npub_id = int(row["id"])  # update path
 
@@ -250,7 +252,7 @@ def upsert_event(
     On update, only non-null fields will be updated.
     """
     cursor = connection.cursor()
-    cursor.execute("SELECT id FROM events WHERE event_id = ?", (event_id,))
+    cursor.execute("SELECT id FROM events WHERE event_id = ? AND task_id = ?", (event_id, task_id))
     row = cursor.fetchone()
 
     if row is None:
@@ -275,7 +277,7 @@ def upsert_event(
         )
         event_row_id = cursor.lastrowid
         connection.commit()
-        return event_row_id
+        return int(event_row_id) if event_row_id is not None else 0
 
     event_row_id = int(row["id"])  # update path
 
@@ -407,6 +409,8 @@ def enqueue_job(
     since: int,
     till: int,
     status: str = "queued",
+    api_base_url: Optional[str] = None,
+    api_model: Optional[str] = None,
 ) -> int:
     """Create a job row for an npub and return job id."""
     if status not in JOB_STATUSES:
@@ -416,10 +420,10 @@ def enqueue_job(
     cursor = connection.cursor()
     cursor.execute(
         """
-        INSERT INTO jobs (npub_id, since, till, status)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO jobs (npub_id, since, till, status, api_base_url, api_model)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (npub_id, since, till, status),
+        (npub_id, since, till, status, api_base_url, api_model),
     )
     job_id = cursor.lastrowid
     connection.commit()
@@ -434,6 +438,8 @@ def update_job_status(
     error: Optional[str] = None,
     started_at: Optional[int] = None,
     finished_at: Optional[int] = None,
+    api_base_url: Optional[str] = None,
+    api_model: Optional[str] = None,
 ) -> None:
     """Update status and timestamps for a job."""
     if status not in JOB_STATUSES:
@@ -453,6 +459,13 @@ def update_job_status(
     if finished_at is not None:
         updates.append("finished_at = ?")
         params.append(finished_at)
+
+    if api_base_url is not None:
+        updates.append("api_base_url = ?")
+        params.append(api_base_url)
+    if api_model is not None:
+        updates.append("api_model = ?")
+        params.append(api_model)
 
     params.append(job_id)
     set_clause = ", ".join(updates)
@@ -609,6 +622,30 @@ def fetch_api_key(
         "api_key": row["api_key"],
         "balance": float(row["balance"]),
     }
+
+
+def get_api_key_from_keys_db(keys_db_path: str, api_id: str = "main") -> Optional[str]:
+    """
+    Open a separate keys database file and return the API key string for the given api_id.
+    Returns None on any error or if not found. This does not initialize any other tables.
+    """
+    try:
+        conn = get_connection(keys_db_path)
+    except Exception:
+        return None
+    try:
+        rec = fetch_api_key(conn, api_id=api_id)
+        if rec and isinstance(rec, dict):
+            value = rec.get("api_key")
+            return str(value) if value is not None else None
+        return None
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

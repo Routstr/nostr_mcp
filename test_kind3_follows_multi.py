@@ -63,6 +63,7 @@ async def test_fetch_kind3_follows_and_multi():
     print("Total layers:", multi_result.get("total_layers"))
     print("Failed authors:", multi_result.get("failed_authors", []))
     print("Total events across layers:", multi_result.get("total_events"))
+    print("Events across layers:", multi_result.get("output"))
 
 
 if __name__ == "__main__":

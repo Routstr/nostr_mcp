@@ -7,8 +7,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import logging
 
 import aiohttp
+from chat_utils import chat_completion_formatting
 
 from pynostr.key import PublicKey
+
+from utils import get_api_base_url_and_model
 
 # Optional storage
 try:
@@ -18,6 +21,7 @@ try:
         store_collected_data,
         upsert_event,
         fetch_api_key,
+        get_api_key_from_keys_db,
     )
 except Exception:
     get_connection = None  # type: ignore
@@ -150,31 +154,10 @@ async def collect_all_data_for_npub(
             pk = layer.get("pubkey")
             if isinstance(pk, str) and pk:
                 authors_from_layers.append(pk)
+
     # Deduplicate while preserving order
     _seen_hex: set[str] = set()
     authors_from_layers = [a for a in authors_from_layers if not (a in _seen_hex or _seen_hex.add(a))]
-
-    profiles_by_hex: Dict[str, Dict[str, str]] = {}
-    if authors_from_layers:
-        try:
-            profiles_json = await get_nostr_profiles(
-                pubkeys=authors_from_layers,
-                relays=combined_relays if combined_relays else None,
-            )
-            profiles_parsed = json.loads(profiles_json)
-            for p in profiles_parsed.get("profiles", []) or []:
-                if not isinstance(p, dict) or not p.get("success"):
-                    continue
-                hex_pk = p.get("pubkey")
-                prof = p.get("profile") or {}
-                if not isinstance(prof, dict):
-                    prof = {}
-                name_val = (prof.get("display_name") or prof.get("name") or "")
-                pic_val = (prof.get("picture") or prof.get("image") or "")
-                if hex_pk:
-                    profiles_by_hex[str(hex_pk)] = {"name": str(name_val or ""), "profile_pic": str(pic_val or "")}
-        except Exception:
-            pass
 
     # Build mapping from hex pubkey to formatted summary structure
     for layer in layers:
@@ -183,22 +166,15 @@ async def collect_all_data_for_npub(
         hex_author = layer.get("pubkey", "")
         if not hex_author:
             continue
-        events_formatted: List[Dict[str, Any]] = []
-        for ev in layer.get("events", []) or []:
-            events_formatted.append({
-                "event_id": ev.get("id", ""),
-                "event_content": ev.get("content", ""),
-                "context_content": "Standalone event (not part of a thread)",
-                "timestamp": ev.get("created_at", 0),
-                "events_in_thread": [ev.get("id")] if ev.get("id") else [],
-            })
+        # Events from layer are already formatted; pass through directly
+        events_formatted: List[Dict[str, Any]] = list(layer.get("events", []) or [])
         summaries_by_hex[hex_author] = {
             "npub": _pubkey_to_npub(hex_author),
-            "name": (profiles_by_hex.get(hex_author, {}) or {}).get("name", "") or layer.get("name", ""),
-            "profile_pic": (profiles_by_hex.get(hex_author, {}) or {}).get("profile_pic", "") or layer.get("profile_pic", ""),
+            "name": layer.get("name", ""),
+            "profile_pic": layer.get("profile_pic", ""),
             "events": events_formatted,
         }
-
+    
     return {
         "input": {
             "npub": npub,
@@ -242,7 +218,7 @@ async def _main(argv: List[str]) -> int:
         except Exception as e:
             print(f"Warning: failed to store collected data: {e}", file=sys.stderr)
     return 0
-
+    
 async def summarize_and_add_relevancy_score(
     instruction: str,
     npub: str,
@@ -295,71 +271,29 @@ async def summarize_and_add_relevancy_score(
     # Per user preference, API keys are in a separate DB (keys.db). [[memory:8544858]]
     keys_db_path = os.path.join(base_dir_val, "keys.db")
 
-
-
-    # Load API key if available; URL left blank intentionally for user to fill later
+    # Load API key from separate keys DB via sqlite_store helper
     api_key_value: Optional[str] = None
-    if fetch_api_key is not None and os.path.exists(keys_db_path):
-        try:
-            kconn = get_connection(keys_db_path)
-            try:
-                rec = fetch_api_key(kconn, api_id="main")
-                if rec and isinstance(rec, dict):
-                    api_key_value = rec.get("api_key")
-            finally:
-                kconn.close()
-        except Exception:
-            api_key_value = None
+    if 'os' not in globals():
+        import os  # lazy import to avoid top-level dependency if unused
+    if os.path.exists(keys_db_path) and get_api_key_from_keys_db is not None:
+        api_key_value = get_api_key_from_keys_db(keys_db_path, api_id="main")
 
-    api_base_url = "https://ai.redsh1ft.com"  # Intentionally left blank; user will set this
-    api_model = "google/gemma-3-27b-it"
+    # use shared chat utils for messages/response format
+    # Ensure since and till are ints, as required by get_api_base_url_and_model
+    # Set default API base URL and model at the top of the file
+    # (move these to the top of the file if not already present)
+    DEFAULT_API_BASE_URL = "https://ai.redsh1ft.com"  # Intentionally left blank; user will set this
+    DEFAULT_API_MODEL = "google/gemma-3-27b-it"
 
-    async def _chat_completion(session: aiohttp.ClientSession, payload: Dict[str, Any]) -> Dict[str, Any]:
-        if not api_base_url:
-            raise ValueError("OpenAI-compatible API base URL is not set.")
-        url = api_base_url.rstrip("/") + "/v1/chat/completions"
-        headers = {
-            "Content-Type": "application/json",
-            **({"Authorization": f"Bearer {api_key_value}"} if api_key_value else {}),
-        }
-        try:
-            async with session.post(url, json=payload, headers=headers) as resp:
-                body = await resp.text()
-                
-                if not body.strip():
-                    raise ValueError("Empty response from API")
-                
-                if resp.status >= 400:
-                    raise ValueError(f"HTTP {resp.status} error from API: {resp.reason}. Body: {body[:500]}")
-                
-                try:
-                    return json.loads(body)
-                except json.JSONDecodeError as e:
-                    raise ValueError(f"Invalid JSON response from API: {e}. Response body: {body[:500]}")
-        except aiohttp.ClientError as e:
-            raise ValueError(f"Network error connecting to API: {e}")
-
-    def _build_messages(user_input: str, include_summary: bool) -> List[Dict[str, str]]:
-        if include_summary:
-            system_prompt = (
-                "This is the content of a Nostr event or its thread context you're supposed to score:"+user_input+"\n"
-                "Return a strict JSON object with keys: \n"
-                "- context_summary: short summary of the content/thread (<= 280 chars).\n"
-                "- relevancy_score: score of 0-100 indicating relevance to the instruction:"+instruction+". 100 if the content is exactly what the instruction is asking for, 0 if the content is not relevant to the instruction. if the content is relevant but not exactly what the instruction is asking for, give a score between 0 and 100 based on how relevant it is to the instruction. \n"
-                "- reason_for_score: reason for the score given based on the instruction \n"
-                "No additional text."
-            )
+    if since is None or till is None:
+        api_base_url, api_model = DEFAULT_API_BASE_URL, DEFAULT_API_MODEL
+    else:
+        result = get_api_base_url_and_model(npub, int(since), int(till), db_path)
+        if result is not None:
+            api_base_url = result["api_base_url"] if result and "api_base_url" in result else DEFAULT_API_BASE_URL
+            api_model = result["api_model"] if result and "api_model" in result else DEFAULT_API_MODEL
         else:
-            system_prompt = (
-                "This is the content of a single Nostr event you're supposed to score (no thread context):"+user_input+"\n"
-                "Return a strict JSON object with two keys: relevancy_score and reason_for_score \n"
-                "- relevancy_score: score of 0-100 indicating relevance to the instruction: "+instruction+". 100 if the content is exactly what the instruction is asking for, 0 if the content is not relevant to the instruction. if the content is relevant but not exactly what the instruction is asking for, give a score between 0 and 100 based on how relevant it is to the instruction. \n"
-                "- reason_for_score: reason for the score given based on the instruction \n"
-                "No additional text."
-            )
-        return [
-            {"role": "user", "content": system_prompt}
-        ]
+            api_base_url, api_model = DEFAULT_API_BASE_URL, DEFAULT_API_MODEL
 
     # Connect to goose.db
     connection = get_connection(db_path)
@@ -459,74 +393,28 @@ async def summarize_and_add_relevancy_score(
             }
 
 
-        def _build_response_format(include_summary: bool) -> Dict[str, Any]:
-            if include_summary:
-                return {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "summary_and_relevancy",
-                        "strict": True,
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "context_summary": {
-                                    "type": "string",
-                                    "description": "Short summary (<= 280 chars) of content/thread",
-                                },
-                                "relevancy_score": {
-                                    "type": "number",
-                                    "description": "Score 0-100 for relevance to the instruction",
-                                },
-                                "reason_for_score": {
-                                    "type": "string",
-                                    "description": "Reason for the score given based on the instruction",
-                                },
-                            },
-                            "required": ["context_summary", "relevancy_score", "reason_for_score"],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            else:
-                return {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "relevancy_only",
-                        "strict": True,
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "relevancy_score": {
-                                    "type": "number",
-                                    "description": "Score 0-100 for relevance to the instruction",
-                                },
-                                "reason_for_score": {
-                                    "type": "string",
-                                    "description": "Reason for the score given based on the instruction",
-                                },
-                            },
-                            "required": ["relevancy_score", "reason_for_score"],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
+        # response format moved to chat_utils
 
         async def _worker(session: aiohttp.ClientSession, job: Dict[str, Any]) -> Dict[str, Any]:
             user_input = job["user_input"]
             include_summary = job["include_summary"]
-            messages = _build_messages(user_input, include_summary=include_summary)
-            payload = {
-                "model": api_model,
-                "messages": messages,
-                "temperature": 0.2,
-                "response_format": _build_response_format(include_summary),
-            }
+            # Call shared chat completion utility directly
 
             attempts = 3
             last_error: Optional[Exception] = None
             for attempt in range(1, attempts + 1):
                 try:
-                    resp = await _chat_completion(session, payload)
+                    resp = await chat_completion_formatting(
+                        session=session,
+                        api_base_url=api_base_url,
+                        api_key_value=api_key_value,
+                        model=api_model,
+                        instruction=instruction,
+                        user_input=user_input,
+                        include_summary=include_summary,
+                        temperature=0.2,
+                        messages=None,
+                    )
                     content_text = (
                         ((resp.get("choices") or [{}])[0].get("message") or {}).get("content")
                         if isinstance(resp, dict) else None
@@ -642,6 +530,7 @@ async def summarize_and_add_relevancy_score(
                             context_summary=context_summary_val or None,
                             relevancy_score=relevancy_score_num,
                             reason_for_score=reason_for_score_val,
+                            task_id=task_id
                         )
                         updated += 1
 
@@ -685,69 +574,6 @@ async def summarize_and_add_relevancy_score(
             connection.close()
         except Exception:
             pass
-
-async def summarize_and_add_relevancy_score2(
-    instruction: str,
-    npub: str,
-    since: Optional[int] = None,
-    till: Optional[int] = None,
-    max_concurrency: int = 20,
-    base_dir: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Summarize events and add relevancy scores in goose.db for a given npub.
-
-    - Fetches events from the local SQLite DB (goose.db)
-    - Uses context_content when the event is part of a thread (has related events)
-    - Calls an OpenAI-compatible API to generate {context_summary, relevancy_score}
-    - Stores results back into the DB (events.context_summary, events.relevancy_score)
-
-    Args:
-        instruction: Instruction passed to the LLM (e.g., what to score for)
-        npub: The npub whose events to process
-        since: Optional unix timestamp lower bound
-        till: Optional unix timestamp upper bound
-
-    Returns:
-        Summary dict with counts and per-event statuses.
-    """
-    import os
-    import sqlite3
-
-    if get_connection is None:
-        raise RuntimeError("sqlite storage is unavailable in this runtime")
-
-    # Resolve DB paths
-    base_dir_val = base_dir or os.path.dirname(__file__)
-    db_path = os.path.join(base_dir_val, "goose.db")
-
-    # Per user preference, API keys are in a separate DB (keys.db). [[memory:8544858]]
-    keys_db_path = os.path.join(base_dir_val, "keys.db")
-
-    # Load API key if available; URL left blank intentionally for user to fill later
-    api_key_value: Optional[str] = None
-    if fetch_api_key is not None and os.path.exists(keys_db_path):
-        try:
-            kconn = get_connection(keys_db_path)
-            try:
-                rec = fetch_api_key(kconn, api_id="main")
-                if rec and isinstance(rec, dict):
-                    api_key_value = rec.get("api_key")
-            finally:
-                kconn.close()
-        except Exception:
-            api_key_value = None
-
-    api_base_url = "https://ai.redsh1ft.com"  # Intentionally left blank; user will set this
-    api_model = "google/gemma-3-27b-it"
-
-    return {
-        "success": True,
-        "npub": npub,
-        "processed": 0,
-        "updated": 0,
-        "skipped": 0,
-        "details": [],
-    }
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(_main(sys.argv[1:])))

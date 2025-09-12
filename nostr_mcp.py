@@ -14,7 +14,7 @@ from pynostr.relay_manager import RelayManager
 from pynostr.filters import FiltersList, Filters
 from pynostr.key import PrivateKey, PublicKey
 from dotenv import load_dotenv
-from utils import fetch_event_context, summarize_thread_context, parse_e_tags, _extract_outbox_relays_from_kind10002
+from utils import fetch_event_context, summarize_thread_context, parse_e_tags, _extract_outbox_relays_from_kind10002, process_events_for_npub
 
 # Load environment variables
 load_dotenv()
@@ -79,7 +79,18 @@ async def fetch_nostr_events(
             limit = 1
             
         used_timeout = DEFAULT_TIMEOUT
-        used_relays = relays or (MAIN_RELAYS + BACKUP_RELAYS)
+        # List of relays to filter out
+        FILTERED_RELAYS = [
+            "wss://pyramid.fiatjaf.com/",
+            "wss://filter.nostr.wine/",
+            "wss://relay.dergigi.com/",
+            "wss://nostr.wine/",
+            "wss://wot.dergigi.com/"
+        ]
+        
+        # Filter out unwanted relays
+        all_relays = relays or (MAIN_RELAYS + BACKUP_RELAYS)
+        used_relays = [relay for relay in all_relays if relay not in FILTERED_RELAYS]
         
         # Convert pubkey formats if needed
         processed_authors = []
@@ -706,7 +717,8 @@ async def get_events_for_summary(
                 context_result = await fetch_event_context(
                     event_id=event_id,
                     fetch_events_func=fetch_nostr_events,
-                    relays=used_relays
+                    relays=used_relays,
+                    initial_event=event
                 )
                 
                 if context_result['success'] and context_result['thread_events']:
@@ -817,10 +829,10 @@ async def get_events_for_summary_multi(
     since: int,
     relays: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Fetch events for multiple authors since a timestamp.
+    """Fetch events for multiple authors since a timestamp with thread context.
     
     Returns a layers JSON where each layer corresponds to one author and
-    contains their events in the same format as `get_events_for_summary`.
+    contains their events in the same formatted shape as `get_events_for_summary`.
     """
     try:
         used_relays = relays or (MAIN_RELAYS + BACKUP_RELAYS)
@@ -841,7 +853,7 @@ async def get_events_for_summary_multi(
                 'output': []
             }
 
-        events = parsed.get('events', [])
+        events = parsed.get('events', []) or []
 
         # Group events by author (hex pubkey)
         events_by_pubkey: Dict[str, List[Dict[str, Any]]] = {}
@@ -851,37 +863,54 @@ async def get_events_for_summary_multi(
                 continue
             events_by_pubkey.setdefault(pk, []).append(ev)
 
-        # Build layers preserving the previous shape per input author
-        layers: List[Dict[str, Any]] = []
-        for author in authors:
-            try:
-                if author.startswith('npub'):
-                    pk = PublicKey.from_npub(author)
-                    hex_author = pk.hex()
-                else:
-                    hex_author = author
-            except Exception as e:
-                layers.append({
-                    'success': False,
-                    'author_input': author,
-                    'since_timestamp': since,
-                    'error': f'Invalid author pubkey: {str(e)}',
-                    'events': [],
-                    'total_events': 0
-                })
-                continue
+        # Build layers using shared utility
+        layers: List[Dict[str, Any]] = await process_events_for_npub(
+            authors=authors,
+            since=since,
+            used_relays=used_relays,
+            events_by_pubkey=events_by_pubkey,
+            fetch_events_func=fetch_nostr_events,
+        )
 
-            author_events = events_by_pubkey.get(hex_author, [])
-            layers.append({
-                'success': True,
-                'author_input': author,
-                'pubkey': hex_author,
-                'since_timestamp': since,
-                'name': '',
-                'profile_pic': '',
-                'total_events': len(author_events),
-                'events': author_events
-            })
+        layers = [ layer for layer in layers if layer.get('success') and layer.get('total_events', 0) > 0]
+        authors = [layer.get('pubkey') for layer in layers]
+        # Batch-fetch metadata (kind 0) for authors that have events
+        latest_md_by_pubkey: Dict[str, Dict[str, Any]] = {}
+        if authors:
+            try:
+                md_raw = await fetch_nostr_events(
+                    authors=authors,
+                    kinds=[0],
+                    relays=used_relays
+                )
+                md_parsed = json.loads(md_raw)
+                if md_parsed.get('success'):
+                    md_events = md_parsed.get('events', []) or []
+                    for ev in md_events:
+                        pk_hex = ev.get('pubkey')
+                        if not pk_hex:
+                            continue
+                        # Take the newest only; events are sorted newest-first
+                        if pk_hex not in latest_md_by_pubkey:
+                            latest_md_by_pubkey[pk_hex] = ev
+            except Exception:
+                pass
+
+        # Fill metadata into layers
+        for layer in layers:
+            if not layer.get('success'):
+                continue
+            pk_hex = layer.get('pubkey')
+            ev = latest_md_by_pubkey.get(pk_hex)
+            if not ev:
+                continue
+            try:
+                md_content = json.loads(ev.get('content', '') or '{}')
+                layer['name'] = md_content.get('display_name') or md_content.get('name') or ''
+                layer['profile_pic'] = md_content.get('picture') or md_content.get('image') or ''
+            except Exception:
+                # Keep defaults on parse error
+                pass
 
         total_events = sum(layer.get('total_events', 0) for layer in layers if layer.get('success'))
         failed_authors = [layer.get('author_input') for layer in layers if not layer.get('success')]
