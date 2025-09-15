@@ -37,8 +37,8 @@ extensions:
   available_tools: []
 
 settings:
-  goose_provider: openrouter
-  goose_model: anthropic/claude-sonnet-4
+  goose_provider: openai
+  goose_model: moonshotai/kimi-k2
   temperature: 0.0
 
 activities:
