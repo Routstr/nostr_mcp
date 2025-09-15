@@ -63,7 +63,7 @@ def run_command():
         cmd = f"{base_dir}/run_goose.sh {npub} {since} {curr_timestamp} \"{instruction}\" {base_dir}"
         print("FILES DO NOT EXIST. RUNNING new")
        
-        api_base_url = "https://ai.redsh1ft.com"  # Intentionally left blank; user will set this
+        api_base_url = "https://api.routstr.com"  # Intentionally left blank; user will set this
         api_model = "google/gemma-3-27b-it"
  
         # Mark command as running before starting
@@ -145,7 +145,7 @@ def rerun_command():
 
         # Optional: npub/since/curr_timestamp to pull API config
         keys_db_path = os.path.join(base_dir, "keys.db")
-        api_base_url = "https://ai.redsh1ft.com"  # Intentionally left blank; user will set this
+        api_base_url = "https://api.routstr.com"  # Intentionally left blank; user will set this
         api_model = "google/gemma-3-27b-it"
         api_key_value = None
         if os.path.exists(keys_db_path):

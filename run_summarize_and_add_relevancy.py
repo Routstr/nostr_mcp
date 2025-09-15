@@ -11,8 +11,8 @@ def main() -> None:
     npub = "4ad6fa2d16e2a9b576c863b4cf7404a70d4dc320c0c447d10ad6ff58993eacc8"
 
     # Specify a time window; set to None to disable filtering
-    since = 1757537580
-    till = 1757626893
+    since = 1757594400
+    till = 1757687548
 
     base_dir = "/Users/r/projects/routstr_main/nostr_mcp"
 

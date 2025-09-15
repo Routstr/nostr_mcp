@@ -38,7 +38,7 @@ def build_response_format(include_summary: bool) -> Dict[str, Any]:
         return {
             "type": "json_schema",
             "json_schema": {
-                "name": "summary_and_relevancy",
+                "name": "summary_relevancy_score_and_reason",
                 "strict": True,
                 "schema": {
                     "type": "object",
@@ -65,7 +65,7 @@ def build_response_format(include_summary: bool) -> Dict[str, Any]:
         return {
             "type": "json_schema",
             "json_schema": {
-                "name": "relevancy_only",
+                "name": "relevancy_score_and_reason",
                 "strict": True,
                 "schema": {
                     "type": "object",
@@ -173,7 +173,7 @@ def chat_completions(
 
     # Fallback defaults if missing
     if not api_base_url:
-        api_base_url = "https://ai.redsh1ft.com"
+        api_base_url = "https://api.routstr.com"
     if not api_model:
         api_model = "google/gemma-3-27b-it"
 
@@ -271,7 +271,7 @@ async def async_chat_completions(
 
     # Fallback defaults if missing
     if not api_base_url:
-        api_base_url = "https://ai.redsh1ft.com"
+        api_base_url = "https://api.routstr.com"
     if not api_model:
         api_model = "google/gemma-3-27b-it"
 

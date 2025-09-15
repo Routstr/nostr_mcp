@@ -282,7 +282,7 @@ async def summarize_and_add_relevancy_score(
     # Ensure since and till are ints, as required by get_api_base_url_and_model
     # Set default API base URL and model at the top of the file
     # (move these to the top of the file if not already present)
-    DEFAULT_API_BASE_URL = "https://ai.redsh1ft.com"  # Intentionally left blank; user will set this
+    DEFAULT_API_BASE_URL = "https://api.routstr.com"  # Intentionally left blank; user will set this
     DEFAULT_API_MODEL = "google/gemma-3-27b-it"
 
     if since is None or till is None:
@@ -504,6 +504,7 @@ async def summarize_and_add_relevancy_score(
                     relevancy_score_num = result.get("relevancy_score")
                     event_row_id = int(result["event_row_id"])  # for fallback update
                     npub_id_val = int(result["npub_id"])  # for upsert_event path
+                    print(f"result: {result}")
                     reason_for_score_val = str(result.get("reason_for_score") or "").strip()
                     if upsert_event is None:
                         update_fields = []
