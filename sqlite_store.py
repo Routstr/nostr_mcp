@@ -381,16 +381,49 @@ def store_npub_record_with_events(
         parent_row_id = event_id_to_row_id.get(str(event.get("event_id")))
         if parent_row_id is None:
             continue
-        related_external_ids: List[str] = list(event.get("events_in_thread") or [])
+        related_items = list(event.get("events_in_thread") or [])
         related_row_ids: List[int] = []
-        for external_id in related_external_ids:
-            row_id = event_id_to_row_id.get(str(external_id))
-            if row_id is None:
-                found = _get_event_row_id_by_event_id(connection, str(external_id))
-                if found is not None:
-                    row_id = found
-            if row_id is not None:
-                related_row_ids.append(row_id)
+        for item in related_items:
+            # Item can be a full event dict or just an event_id string
+            if isinstance(item, dict):
+                related_event_id = str(item.get("id") or "")
+                if not related_event_id:
+                    continue
+                row_id = event_id_to_row_id.get(related_event_id)
+                if row_id is None:
+                    found = _get_event_row_id_by_event_id(connection, related_event_id)
+                    if found is not None:
+                        row_id = found
+                    else:
+                        row_id = upsert_event(
+                            connection,
+                            npub_id=npub_id,
+                            event_id=related_event_id,
+                            event_content=item.get("event_content"),
+                            timestamp=item.get("timestamp"),
+                            task_id=task_id,
+                        )
+                        # Cache for future lookups in this pass
+                        event_id_to_row_id[related_event_id] = row_id
+                if row_id is not None:
+                    related_row_ids.append(row_id)
+            else:
+                external_id = str(item)
+                row_id = event_id_to_row_id.get(external_id)
+                if row_id is None:
+                    found = _get_event_row_id_by_event_id(connection, external_id)
+                    if found is not None:
+                        row_id = found
+                    else:
+                        row_id = upsert_event(
+                            connection,
+                            npub_id=npub_id,
+                            event_id=external_id,
+                            task_id=task_id,
+                        )
+                        event_id_to_row_id[external_id] = row_id
+                if row_id is not None:
+                    related_row_ids.append(row_id)
 
         if related_row_ids:
             set_event_thread_links(

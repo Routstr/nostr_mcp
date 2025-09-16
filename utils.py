@@ -565,7 +565,7 @@ async def process_events_for_npub(
                             'event_content': event['content'],
                             'timestamp': event['created_at'],
                             'context_content': context_content,
-                            'events_in_thread': [te['id'] for te in thread_events],
+                            'events_in_thread': [te for te in thread_events],
                             'pubkey': event['pubkey'],
                             'kind': event['kind']
                         }
@@ -576,7 +576,7 @@ async def process_events_for_npub(
                         'event_content': event['content'],
                         'timestamp': event['created_at'],
                         'context_content': "Standalone event (not part of a thread)",
-                        'events_in_thread': [event_id],
+                        'events_in_thread': [event],
                         'pubkey': event['pubkey'],
                         'kind': event['kind']
                     }

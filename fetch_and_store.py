@@ -131,22 +131,72 @@ async def collect_all_data_for_npub(
     summaries_by_hex: Dict[str, Any] = {}
     authors: List[str] = [f.get("hex", "") for f in following if f.get("hex")]
 
-    # Compute minimal relay set covering follows' outbox relays (kind 10002)
-    combined_relays: List[str] = await compute_selected_relays_for_follows(
-        authors,
-        relays=outbox_relays or None,
-    )
-
     multi_result: Dict[str, Any] = {"success": True, "output": []}
     if authors:
-        try:
-            multi_result = await get_events_for_summary_multi(
-                authors=authors,
-                since=since,
-                relays=combined_relays if combined_relays else None,
-            )
-        except Exception as e:
-            multi_result = {"success": False, "error": str(e), "output": []}
+
+        # Compute minimal relay set covering follows' outbox relays (kind 10002)
+        combined_relays: List[str] = await compute_selected_relays_for_follows(
+            authors,
+            relays=outbox_relays or None,
+        )
+
+        # If more than 50 authors, split into chunks of 50 and aggregate results
+        CHUNK_SIZE = 50
+        if len(authors) > CHUNK_SIZE:
+            all_layers: List[Dict[str, Any]] = []
+            relays_union: List[str] = []
+            failed_authors_all: List[str] = []
+            total_events_sum = 0
+
+            def _merge_relays(existing: List[str], new_relays: Optional[List[str]]) -> List[str]:
+                seen = set(existing)
+                for r in new_relays or []:
+                    if r not in seen:
+                        seen.add(r)
+                        existing.append(r)
+                return existing
+
+            for i in range(0, len(authors), CHUNK_SIZE):
+                batch = authors[i:i + CHUNK_SIZE]
+                try:
+                    batch_result = await get_events_for_summary_multi(
+                        authors=batch,
+                        since=since,
+                        relays=combined_relays if combined_relays else None,
+                    )
+                except Exception as e:
+                    # Record failure but continue with other batches
+                    failed_authors_all.extend(batch)
+                    continue
+
+                if isinstance(batch_result, dict) and batch_result.get("success"):
+                    layers_part = batch_result.get("output", []) or []
+                    all_layers.extend(layers_part)
+                    total_events_sum += int(batch_result.get("total_events", 0) or 0)
+                    failed_authors_all.extend(batch_result.get("failed_authors", []) or [])
+                    relays_union = _merge_relays(relays_union, batch_result.get("relays_used") or [])
+                else:
+                    failed_authors_all.extend(batch)
+
+            multi_result = {
+                "success": True,
+                "since_timestamp": since,
+                "relays_used": relays_union if relays_union else (combined_relays or None),
+                "total_layers": len(all_layers),
+                # Prefer summing per-batch totals; fallback to computing from layers
+                "total_events": total_events_sum if total_events_sum else sum(int(l.get("total_events", 0) or 0) for l in all_layers),
+                "output": all_layers,
+                "failed_authors": failed_authors_all,
+            }
+        else:
+            try:
+                multi_result = await get_events_for_summary_multi(
+                    authors=authors,
+                    since=since,
+                    relays=combined_relays if combined_relays else None,
+                )
+            except Exception as e:
+                multi_result = {"success": False, "error": str(e), "output": []}
 
     layers: List[Dict[str, Any]] = multi_result.get("output", []) if isinstance(multi_result, dict) else []
 
@@ -188,7 +238,12 @@ async def collect_all_data_for_npub(
         "outbox_relays": outbox_relays,
         "following_count": len(following),
         "following": following,
-        "summaries_by_hex": summaries_by_hex
+        "summaries_by_hex": summaries_by_hex,
+        # Consolidated metadata from multi fetch for visibility/debugging
+        "multi_relays_used": multi_result.get("relays_used"),
+        "multi_total_layers": multi_result.get("total_layers"),
+        "multi_total_events": multi_result.get("total_events"),
+        "multi_failed_authors": multi_result.get("failed_authors", []),
     }
 
 
