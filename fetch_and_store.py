@@ -11,7 +11,7 @@ from chat_utils import chat_completion_formatting
 
 from pynostr.key import PublicKey
 
-from utils import get_api_base_url_and_model
+from utils import get_api_base_url_and_model, compute_selected_relays_for_follows
 
 # Optional storage
 try:
@@ -131,8 +131,11 @@ async def collect_all_data_for_npub(
     summaries_by_hex: Dict[str, Any] = {}
     authors: List[str] = [f.get("hex", "") for f in following if f.get("hex")]
 
-    # Use only outbox relays
-    combined_relays: List[str] = list(dict.fromkeys([r for r in outbox_relays if r]))
+    # Compute minimal relay set covering follows' outbox relays (kind 10002)
+    combined_relays: List[str] = await compute_selected_relays_for_follows(
+        authors,
+        relays=outbox_relays or None,
+    )
 
     multi_result: Dict[str, Any] = {"success": True, "output": []}
     if authors:
@@ -504,7 +507,6 @@ async def summarize_and_add_relevancy_score(
                     relevancy_score_num = result.get("relevancy_score")
                     event_row_id = int(result["event_row_id"])  # for fallback update
                     npub_id_val = int(result["npub_id"])  # for upsert_event path
-                    print(f"result: {result}")
                     reason_for_score_val = str(result.get("reason_for_score") or "").strip()
                     if upsert_event is None:
                         update_fields = []

@@ -15,6 +15,7 @@ from pynostr.filters import FiltersList, Filters
 from pynostr.key import PrivateKey, PublicKey
 from dotenv import load_dotenv
 from utils import fetch_event_context, summarize_thread_context, parse_e_tags, _extract_outbox_relays_from_kind10002, process_events_for_npub
+from constants import blacklisted_relays
 
 # Load environment variables
 load_dotenv()
@@ -79,18 +80,9 @@ async def fetch_nostr_events(
             limit = 1
             
         used_timeout = DEFAULT_TIMEOUT
-        # List of relays to filter out
-        FILTERED_RELAYS = [
-            "wss://pyramid.fiatjaf.com/",
-            "wss://filter.nostr.wine/",
-            "wss://relay.dergigi.com/",
-            "wss://nostr.wine/",
-            "wss://wot.dergigi.com/"
-        ]
-        
         # Filter out unwanted relays
         all_relays = relays or (MAIN_RELAYS + BACKUP_RELAYS)
-        used_relays = [relay for relay in all_relays if relay not in FILTERED_RELAYS]
+        used_relays = [relay for relay in all_relays if relay not in blacklisted_relays]
         
         # Convert pubkey formats if needed
         processed_authors = []
@@ -995,6 +987,7 @@ async def fetch_and_store(
                 db_error = f"failed to resolve db_path from base_dir: {str(e)}"
                 db_path = None
 
+        print(f"collected: {collected}")
         if db_path:
             try:
                 from sqlite_store import (

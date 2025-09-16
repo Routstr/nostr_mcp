@@ -7,6 +7,13 @@
 
 set -e
 
+# Load project environment variables if present
+if [ -f "/Users/r/projects/routstr_main/nostr_mcp/.env" ]; then
+  set -a
+  . "/Users/r/projects/routstr_main/nostr_mcp/.env"
+  set +a
+fi
+
 cd /Users/r/projects/routstr_main/nostr_mcp
 
 if [ "$#" -ne 5 ]; then

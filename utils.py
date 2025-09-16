@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 import json
 import asyncio
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable, Awaitable
 import logging
 import aiohttp
-
+from constants import blacklisted_relays
 logger = logging.getLogger("nostr-mcp")
 
 # Import pynostr for pubkey conversion
@@ -106,6 +106,131 @@ def _extract_outbox_relays_from_kind10002(event: Dict[str, Any], include_onion: 
             seen.add(r)
             ordered_unique.append(r)
     return ordered_unique
+
+async def compute_selected_relays_for_follows(
+    follows: List[str],
+    *,
+    relays: Optional[List[str]] = None,
+    fetch_events_func: Optional[Callable[..., Awaitable[str]]] = None,
+) -> List[str]:
+    """Given a list of followed hex pubkeys, compute a minimal relay set.
+
+    Strategy:
+    - Fetch each follow's kind 10002 (outbox relays) events (latest per pubkey)
+    - Build mapping pubkey -> available relays (canonicalized, blocklist applied)
+    - Greedy set cover to select the smallest set so each pubkey is covered by up to 2 relays
+
+    Args:
+        follows: List of hex pubkeys to cover
+        relays: Optional relay list used for fetching kind 10002 events
+        fetch_events_func: Optional async function compatible with fetch_nostr_events
+
+    Returns:
+        List of selected relay URLs (canonicalized, lowercase, without trailing slashes/commas)
+    """
+    try:
+        if not follows:
+            return []
+
+        # Lazy import to avoid circular dependencies if a fetch function is not provided
+        if fetch_events_func is None:
+            try:
+                from nostr_mcp import fetch_nostr_events as _default_fetch
+                fetch_events_func = _default_fetch  # type: ignore
+            except Exception as e:
+                logger.warning(f"fetch_nostr_events unavailable: {e}")
+                return []
+
+        # Fetch kind 10002 events for follows
+        raw = await fetch_events_func(
+            authors=follows,
+            kinds=[10002],
+            relays=relays,
+            limit=max(1, len(follows) * 3),
+        )
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict) or not parsed.get("success") or not parsed.get("events"):
+            return []
+
+        events = parsed.get("events") or []
+
+        # Keep only the latest kind 10002 per pubkey
+        latest_by_pubkey: Dict[str, Dict[str, Any]] = {}
+        for ev in events:
+            pk = ev.get("pubkey")
+            if not isinstance(pk, str) or not pk:
+                continue
+            existing = latest_by_pubkey.get(pk)
+            if existing is None or int(ev.get("created_at", 0) or 0) > int(existing.get("created_at", 0) or 0):
+                latest_by_pubkey[pk] = ev
+
+        def _canon(url: Any) -> Any:
+            if not isinstance(url, str):
+                return url
+            u = url.strip().lower()
+            while u.endswith("/") or u.endswith(","):
+                u = u[:-1]
+            return u
+
+        # pubkey -> set of available relays
+        pubkey_to_relays: Dict[str, List[str]] = {}
+        for pk, ev in latest_by_pubkey.items():
+            try:
+                relay_list = _extract_outbox_relays_from_kind10002(ev)
+                canon = []
+                for r in relay_list:
+                    cr = _canon(r)
+                    if isinstance(cr, str) and cr and cr not in blacklisted_relays:
+                        canon.append(cr)
+                # Deduplicate while preserving order
+                seen: set[str] = set()
+                canon_unique = [r for r in canon if not (r in seen or seen.add(r))]
+                if canon_unique:
+                    pubkey_to_relays[pk] = canon_unique
+            except Exception:
+                continue
+
+        if not pubkey_to_relays:
+            return []
+
+        # Each pubkey needs up to 2 distinct relays, capped by availability
+        required_slots: Dict[str, int] = {pk: min(2, len(rs)) for pk, rs in pubkey_to_relays.items()}
+
+        selected_relays: set[str] = set()
+        # Build reverse index: relay -> set(pubkeys)
+        relay_to_pubkeys: Dict[str, set[str]] = {}
+        for pk, rs in pubkey_to_relays.items():
+            for r in rs:
+                relay_to_pubkeys.setdefault(r, set()).add(pk)
+
+        def remaining_slots_total() -> int:
+            return int(sum(required_slots.values()))
+
+        # Greedy selection: pick relay covering most remaining slots
+        while remaining_slots_total() > 0:
+            best_relay: Optional[str] = None
+            best_gain = 0
+            for relay, pks in relay_to_pubkeys.items():
+                if relay in selected_relays:
+                    continue
+                gain = 0
+                for pk in pks:
+                    if required_slots.get(pk, 0) > 0:
+                        gain += 1
+                if gain > best_gain:
+                    best_gain = gain
+                    best_relay = relay
+            if not best_relay or best_gain == 0:
+                break
+            selected_relays.add(best_relay)
+            for pk in relay_to_pubkeys.get(best_relay, set()):
+                if required_slots.get(pk, 0) > 0:
+                    required_slots[pk] -= 1
+
+        return sorted(selected_relays)
+    except Exception as e:
+        logger.warning(f"compute_selected_relays_for_follows failed: {e}")
+        return []
 
 async def fetch_event_context(
     event_id: str,

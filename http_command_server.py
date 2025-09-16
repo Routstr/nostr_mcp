@@ -3,6 +3,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import subprocess
 import chat_utils
+from nostr_mcp import fetch_and_store, summarize_and_add_relevancy_score
 import utils
 import os
 import sqlite_store
@@ -23,8 +24,13 @@ try:
 except Exception as e:
     print(f"Failed to initialize database at {db_path}: {e}")
 
-@app.route('/run', methods=['POST'])
-def run_command():
+@app.route('/', methods=['GET'])
+def index():
+    print("index")
+    return "this is the goose den, 2 geese"
+
+@app.route('/run_old', methods=['POST'])
+def run_command_old():
     try:
         data = request.get_json()
         if not data or "npub" not in data or "since" not in data or "curr_timestamp" not in data:
@@ -121,6 +127,114 @@ def run_command():
                     npub, since, curr_timestamp, f"exception: {str(e)[:1000]}", db_path=db_path, api_base_url=api_base_url, api_model=api_model
                 )
             except Exception as inner_e:
+                print("Failed to mark command as failed after exception:")
+                traceback.print_exc()
+            print("Unhandled error while running command:")
+            traceback.print_exc()
+            return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        print("Unhandled error in run_command:")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/run', methods=['POST'])
+def run_command():
+    try:
+        data = request.get_json()
+        if not data or "npub" not in data or "since" not in data or "curr_timestamp" not in data:
+            return jsonify({"error": "Missing required parameters"}), 400
+        
+        npub = data["npub"]
+        since = data["since"]
+        curr_timestamp = data["curr_timestamp"]
+        instruction = data.get("instruction", "Posts that contain useful information that educate me in someway or the other. Shitposting should be avoided. Low effort notes should be avoided. ")
+        db_path = os.path.join(base_dir, "goose.db")
+
+        # If job already completed for these parameters, return formatted output from DB
+        try:
+            print(npub, since, curr_timestamp)
+            job_status = utils.get_job_status(npub, since, curr_timestamp, db_path=db_path)
+            if job_status == "success":
+                print("JOB COMPLETED - returning formatted output from DB")
+                formatted_result = utils.load_formatted_npub_output(npub, since, curr_timestamp)
+                return jsonify(formatted_result)
+        except Exception as e:
+            print("Failed to check job status:")
+            traceback.print_exc()
+            return jsonify({"error": f"Failed to check job status: {str(e)}"}), 500
+        # Check if job is already queued/running for these parameters
+        try:
+            job_status = utils.get_job_status(npub, since, curr_timestamp, db_path=db_path)
+            if job_status in ("queued", "running"):
+                print("COMMAND ALREADY RUNNING - returning empty JSON")
+                return jsonify({})
+        except Exception as e:
+            print("Failed to check running commands:")
+            traceback.print_exc()
+            return jsonify({"error": f"Failed to check running commands: {str(e)}"}), 500
+        
+        # Files don't exist and no command running, run the pipeline inline via asyncio
+        print("FILES DO NOT EXIST. RUNNING new")
+       
+        api_base_url = "https://api.routstr.com"  # Intentionally left blank; user will set this
+        api_model = "google/gemma-3-27b-it"
+
+        # Mark command as running before starting
+        try:
+            utils.mark_command_running(npub, since, curr_timestamp, db_path=db_path, api_base_url=api_base_url, api_model=api_model)
+            print(f"Marked command as running for {npub}_{since}_{curr_timestamp}")
+        except Exception as e:
+            print("Failed to mark command as running:")
+            traceback.print_exc()
+            return jsonify({"error": f"Failed to mark command as running: {str(e)}"}), 500
+
+        # Define async pipeline and run it synchronously
+        async def pipeline():
+            await fetch_and_store(npub, since, curr_timestamp, base_dir=base_dir)
+            return await summarize_and_add_relevancy_score(
+                instruction, npub, since, curr_timestamp, max_concurrency=20, base_dir=base_dir
+            )
+
+        try:
+            result = asyncio.run(pipeline())
+            print(f"Pipeline result: {result}")
+
+            # If command succeeded, return formatted JSON output
+            if isinstance(result, dict) and result.get("success"):
+                utils.mark_command_completed(npub, since, curr_timestamp, db_path=db_path, api_base_url=api_base_url, api_model=api_model)
+                print(f"Marked command as completed for {npub}_{since}_{curr_timestamp}")
+                try:
+                    formatted_result = utils.load_formatted_npub_output(npub, since, curr_timestamp)
+                    return jsonify(formatted_result)
+                except Exception as e:
+                    print("Failed to format output:")
+                    traceback.print_exc()
+                    return jsonify({"error": f"Failed to format output: {str(e)}"}), 500
+            else:
+                error_msg = None
+                if isinstance(result, dict):
+                    error_msg = result.get("error") or str(result)
+                try:
+                    utils.mark_command_failed(
+                        npub,
+                        since,
+                        curr_timestamp,
+                        f"pipeline_failed: {str(error_msg)[:1000]}",
+                        db_path=db_path,
+                        api_base_url=api_base_url,
+                        api_model=api_model,
+                    )
+                except Exception:
+                    print("Failed to mark command as failed:")
+                    traceback.print_exc()
+                return jsonify({"error": error_msg or "Pipeline failed"}), 500
+        except Exception as e:
+            # Record failure for the job
+            try:
+                utils.mark_command_failed(
+                    npub, since, curr_timestamp, f"exception: {str(e)[:1000]}", db_path=db_path, api_base_url=api_base_url, api_model=api_model
+                )
+            except Exception:
                 print("Failed to mark command as failed after exception:")
                 traceback.print_exc()
             print("Unhandled error while running command:")
