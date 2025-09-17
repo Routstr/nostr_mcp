@@ -285,6 +285,7 @@ async def summarize_and_add_relevancy_score(
     max_concurrency: int = 20,
     base_dir: Optional[str] = None,
     logger: Optional[logging.Logger] = None,
+    layers: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Summarize events and add relevancy scores in goose.db for a given npub.
 
@@ -562,6 +563,8 @@ async def summarize_and_add_relevancy_score(
                     relevancy_score_num = result.get("relevancy_score")
                     event_row_id = int(result["event_row_id"])  # for fallback update
                     npub_id_val = int(result["npub_id"])  # for upsert_event path
+                    if result.get("reason_for_score", None) is None:
+                        print(f"result: {result}")
                     reason_for_score_val = str(result.get("reason_for_score") or "").strip()
                     if upsert_event is None:
                         update_fields = []

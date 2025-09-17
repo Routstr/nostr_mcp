@@ -228,8 +228,8 @@ def upsert_npub(
     return npub_id
 
 
-def _get_event_row_id_by_event_id(connection: sqlite3.Connection, event_id: str) -> Optional[int]:
-    cur = connection.execute("SELECT id FROM events WHERE event_id = ?", (event_id,))
+def _get_event_row_id_by_event_id(connection: sqlite3.Connection, event_id: str, task_id: str) -> Optional[int]:
+    cur = connection.execute("SELECT id FROM events WHERE event_id = ? AND task_id = ?", (event_id, task_id))
     row = cur.fetchone()
     return int(row["id"]) if row else None
 
@@ -335,7 +335,7 @@ def store_npub_record_with_events(
     connection: sqlite3.Connection,
     *,
     record: Dict[str, Any],
-    task_id: Optional[str] = None,
+    task_id: str,
 ) -> int:
     """Store a single npub record (and its events) shaped like the YAML schema.
 
@@ -357,6 +357,8 @@ def store_npub_record_with_events(
         till=record.get("till"),
         task_id=task_id,
     )
+    # if npub_value != "npub12rv5lskctqxxs2c8rf2zlzc7xx3qpvzs3w4etgemauy9thegr43sf485vg":
+    #     return 0
 
     events = record.get("events") or []
     event_id_to_row_id: Dict[str, int] = {}
@@ -391,7 +393,7 @@ def store_npub_record_with_events(
                     continue
                 row_id = event_id_to_row_id.get(related_event_id)
                 if row_id is None:
-                    found = _get_event_row_id_by_event_id(connection, related_event_id)
+                    found = _get_event_row_id_by_event_id(connection, related_event_id, task_id=task_id+'_extended')
                     if found is not None:
                         row_id = found
                     else:
@@ -399,9 +401,9 @@ def store_npub_record_with_events(
                             connection,
                             npub_id=npub_id,
                             event_id=related_event_id,
-                            event_content=item.get("event_content"),
-                            timestamp=item.get("timestamp"),
-                            task_id=task_id,
+                            event_content=item.get("content"),
+                            timestamp=item.get("created_at"),
+                            task_id=task_id+'_extended',
                         )
                         # Cache for future lookups in this pass
                         event_id_to_row_id[related_event_id] = row_id
@@ -411,7 +413,7 @@ def store_npub_record_with_events(
                 external_id = str(item)
                 row_id = event_id_to_row_id.get(external_id)
                 if row_id is None:
-                    found = _get_event_row_id_by_event_id(connection, external_id)
+                    found = _get_event_row_id_by_event_id(connection, external_id, task_id=task_id+'_extended')
                     if found is not None:
                         row_id = found
                     else:
@@ -419,7 +421,7 @@ def store_npub_record_with_events(
                             connection,
                             npub_id=npub_id,
                             event_id=external_id,
-                            task_id=task_id,
+                            task_id=task_id+'_extended',
                         )
                         event_id_to_row_id[external_id] = row_id
                 if row_id is not None:
@@ -509,17 +511,6 @@ def update_job_status(
 def get_or_create_npub_id(connection: sqlite3.Connection, npub: str) -> int:
     """Utility to fetch an existing npub id or create a new one quickly."""
     return upsert_npub(connection, npub=npub)
-
-
-def bulk_store_records(
-    connection: sqlite3.Connection,
-    records: Iterable[Dict[str, Any]],
-) -> List[int]:
-    """Store multiple npub records with events. Returns npub ids."""
-    ids: List[int] = []
-    for record in records:
-        ids.append(store_npub_record_with_events(connection, record=record))
-    return ids
 
 
 def store_collected_data(

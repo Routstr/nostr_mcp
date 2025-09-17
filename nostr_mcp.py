@@ -987,7 +987,6 @@ async def fetch_and_store(
                 db_error = f"failed to resolve db_path from base_dir: {str(e)}"
                 db_path = None
 
-        print(f"collected: {collected}")
         if db_path:
             try:
                 from sqlite_store import (
